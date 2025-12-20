@@ -24,8 +24,10 @@ if "messages" not in st.session_state:
 
 if "agent" not in st.session_state:
     try:
-        st.session_state.agent = SQLAgent()
-        st.session_state.db_name = Config.DB_NAME
+        # 显示加载提示
+        with st.spinner("🔄 正在连接云端数据库并初始化Agent..."):
+            st.session_state.agent = SQLAgent()
+            st.session_state.db_name = Config.DB_NAME
     except Exception as e:
         st.error(f"初始化 Agent 失败: {e}")
         st.stop()
@@ -34,9 +36,13 @@ if "agent" not in st.session_state:
 with st.sidebar:
     st.title("⚙️ 配置")
     
-    # 数据库选择
+    # 数据库选择（使用缓存避免重复查询）
+    @st.cache_data(ttl=300)  # 缓存5分钟
+    def get_databases():
+        return Config.get_available_databases()
+    
     try:
-        databases = Config.get_available_databases()
+        databases = get_databases()
         selected_db = st.selectbox(
             "选择数据库",
             databases,
@@ -44,8 +50,9 @@ with st.sidebar:
         )
         
         if selected_db != st.session_state.db_name:
-            st.session_state.agent.switch_database(selected_db)
-            st.session_state.db_name = selected_db
+            with st.spinner(f"切换到数据库 {selected_db}..."):
+                st.session_state.agent.switch_database(selected_db)
+                st.session_state.db_name = selected_db
             st.success(f"已切换到: {selected_db}")
     except Exception as e:
         st.error(f"获取数据库列表失败: {e}")
