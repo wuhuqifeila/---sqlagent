@@ -37,7 +37,7 @@ class Config:
     """SQL Agent 配置类"""
     
     # Qwen API 配置
-    DASHSCOPE_API_KEY: str = get_config_value("DASHSCOPE_API_KEY", "sk-58552a72301c44f795e1d7d4fad83f2a")
+    DASHSCOPE_API_KEY: str = get_config_value("DASHSCOPE_API_KEY", "sk-fdefbafb8ecf480b8b0faeb3de8746fc")
     
     # 数据库配置（云端MySQL）
     DB_USER: str = get_config_value("DB_USER", "bobo11")
@@ -47,7 +47,7 @@ class Config:
     DB_NAME: Optional[str] = get_config_value("DB_NAME", "wutongbei")  # 云端数据库名
     
     # LLM 配置
-    MODEL_NAME: str = get_config_value("MODEL_NAME", "qwen-max")
+    MODEL_NAME: str = get_config_value("MODEL_NAME", "qwen3-max")
     TEMPERATURE: float = float(get_config_value("TEMPERATURE", "0"))
     STREAMING: bool = str(get_config_value("STREAMING", "False")).lower() == "true"
     
