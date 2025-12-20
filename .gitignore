@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 环境变量文件 - 不要提交到 Git
+.env
+.env.local
+.env.*.local
+
+# Streamlit secrets - 不要提交到 Git
+.streamlit/secrets.toml
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 数据库文件
+*.sql
+*.db
+*.sqlite
+
+# Excel临时文件
+~$*.xlsx
+~$*.xls
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 数据文件（可选，根据需要调整）
+database_create/*.xlsx
+database_create/*.sql
+

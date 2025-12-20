@@ -1,0 +1,11 @@
+langchain>=0.1.0
+langchain-community>=0.0.20
+langchain-core>=0.1.0
+langchain-openai>=0.0.5
+langgraph>=0.0.20
+pymysql>=1.1.0
+sqlalchemy>=2.0.0
+dashscope>=1.17.0
+python-dotenv>=1.0.0
+streamlit>=1.28.0
+
