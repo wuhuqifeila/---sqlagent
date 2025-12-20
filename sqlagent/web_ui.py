@@ -5,11 +5,84 @@
 import streamlit as st
 import sys
 import os
+from typing import Any, Dict, List, Optional
+from langchain_core.callbacks import BaseCallbackHandler
+import time
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlagent import SQLAgent, Config
+
+
+class StreamlitStatusTraceHandler(BaseCallbackHandler):
+    """把工具调用过程实时写到 Streamlit 的 st.status（默认折叠 + 运行状态）。"""
+
+    def __init__(self, status_box):
+        self.status_box = status_box
+        self.step_no = 0
+        self._current_tool: Optional[str] = None
+
+    @staticmethod
+    def _norm(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            # 常见：{"query": "..."} / {"tool_input": "..."}
+            if "query" in v and isinstance(v["query"], str):
+                return v["query"].strip()
+            if "tool_input" in v and isinstance(v["tool_input"], str):
+                return v["tool_input"].strip()
+            return str(v)
+        return str(v).strip()
+
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: Any = None, **kwargs) -> None:
+        tool_name = (serialized or {}).get("name") or kwargs.get("name") or ""
+        normalized_input = self._norm(input_str if input_str is not None else kwargs.get("input"))
+
+        self.step_no += 1
+        self._current_tool = tool_name
+        self.status_box.write(f"**{self.step_no}. 调用工具：`{tool_name}`**")
+        if normalized_input:
+            if tool_name == "sql_db_query":
+                self.status_box.write("输入（SQL）：")
+                self.status_box.code(normalized_input, language="sql")
+            else:
+                self.status_box.write("输入：")
+                self.status_box.code(normalized_input)
+
+    def on_tool_end(self, output: Any, **kwargs) -> None:
+        normalized_output = self._norm(output)
+        if normalized_output:
+            self.status_box.write("输出：")
+            self.status_box.code(normalized_output)
+
+    def on_tool_error(self, error: Exception, **kwargs) -> None:
+        self.status_box.write(f"❌ 工具执行出错：{error}")
+
+
+class StreamlitAnswerStreamHandler(BaseCallbackHandler):
+    """只用于“最终回答”的 token 流式展示。"""
+
+    def __init__(self, placeholder: "st.delta_generator.DeltaGenerator"):
+        self.placeholder = placeholder
+        self._buf: List[str] = []
+        self._last_flush = 0.0
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self._buf.append(token)
+        now = time.monotonic()
+        # 轻微节流，避免每个 token 都触发 UI 重绘
+        if now - self._last_flush >= 0.05:
+            self.placeholder.markdown("".join(self._buf))
+            self._last_flush = now
+
+    def flush(self) -> str:
+        text = "".join(self._buf)
+        self.placeholder.markdown(text)
+        return text
 
 # 页面配置
 st.set_page_config(
@@ -94,10 +167,13 @@ st.caption(f"当前数据库: **{st.session_state.db_name}**")
 # 显示对话历史
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "sql" in message:
-            with st.expander("查看生成的 SQL"):
+        # 如果是助手消息且有SQL，先显示SQL
+        if message["role"] == "assistant" and "sql" in message:
+            with st.expander("📝 查看生成的 SQL 语句", expanded=False):
                 st.code(message["sql"], language="sql")
+        
+        # 显示消息内容
+        st.markdown(message["content"])
 
 # 输入框
 if prompt := st.chat_input("请输入您的问题..."):
@@ -108,43 +184,54 @@ if prompt := st.chat_input("请输入您的问题..."):
     
     # 显示加载状态
     with st.chat_message("assistant"):
-        with st.spinner("正在查询..."):
-            result = agent.query(prompt)
-        
-        if result["success"]:
-            st.markdown(result["answer"])
-            
-            # 尝试提取并显示 SQL（如果可用）
-            # 注意：这需要修改 agent.py 返回 SQL
-            
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": result["answer"]
-            })
+        # 默认折叠，但会显示“运行中”的状态块（用户可点开看过程）
+        status_box = st.status("正在查询数据库…", expanded=False, state="running")
+        live_handler = StreamlitStatusTraceHandler(status_box)
+
+        # 第1阶段：运行工具/SQL（不流式）
+        tool_result = agent.run_tools(prompt, callbacks=[live_handler])
+
+        # 查询结束：更新状态（仍然保持折叠，避免占页面）
+        if tool_result.get("success"):
+            status_box.update(label="数据库查询完成", state="complete", expanded=False)
         else:
-            error_msg = f"❌ 查询失败: {result.get('error', '未知错误')}"
+            status_box.update(label="数据库查询失败", state="error", expanded=False)
+
+        if tool_result.get("success"):
+            # 如果有生成的SQL，先在可折叠框中展示（在最终回答之前）
+            if tool_result.get("sql"):
+                with st.expander("📝 查看生成的 SQL 语句", expanded=False):
+                    st.code(tool_result["sql"], language="sql")
+
+            # 第2阶段：只流式输出“最终回答”
+            answer_placeholder = st.empty()
+            answer_stream_handler = StreamlitAnswerStreamHandler(answer_placeholder)
+            final_answer = agent.stream_final_answer(
+                question=prompt,
+                sql=tool_result.get("sql", ""),
+                sql_output=tool_result.get("sql_output", ""),
+                callbacks=[answer_stream_handler],
+            )
+            # 确保页面上是完整文本
+            streamed_text = answer_stream_handler.flush()
+            final_answer = streamed_text or final_answer
+
+            # 保存到消息历史（用于刷新后仍可见）
+            message_data = {
+                "role": "assistant",
+                "content": final_answer
+            }
+            # 如果有SQL，也保存到消息历史中
+            if tool_result.get("sql"):
+                message_data["sql"] = tool_result["sql"]
+            
+            st.session_state.messages.append(message_data)
+        else:
+            error_msg = f"❌ 查询失败: {tool_result.get('error', '未知错误')}"
             st.error(error_msg)
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": error_msg
             })
 
-# 示例问题
-with st.expander("💡 示例问题"):
-    st.markdown("""
-    - 查询所有表的名称
-    - 显示前10个客户的信息
-    - 统计每个产品的销售数量
-    - 查询最近一个月的交易记录
-    - 显示数据库中有哪些表
-    """)
-
-# 显示系统信息
-with st.expander("ℹ️ 系统信息"):
-    st.json({
-        "数据库": st.session_state.db_name,
-        "模型": Config.MODEL_NAME,
-        "最大迭代": Config.MAX_ITERATIONS,
-        "默认限制": Config.DEFAULT_LIMIT
-    })
-
+# （已移除）示例问题、系统信息：保持聊天界面简洁

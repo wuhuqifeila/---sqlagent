@@ -57,7 +57,7 @@ class Config:
     AGENT_TYPE: str = get_config_value("AGENT_TYPE", "openai-tools")
     
     # 安全配置
-    DEFAULT_LIMIT: int = int(get_config_value("DEFAULT_LIMIT", "5"))
+    DEFAULT_LIMIT: int = int(get_config_value("DEFAULT_LIMIT", "10"))
     ENABLE_HUMAN_IN_LOOP: bool = str(get_config_value("ENABLE_HUMAN_IN_LOOP", "False")).lower() == "true"
     
     @classmethod

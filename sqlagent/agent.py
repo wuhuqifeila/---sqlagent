@@ -3,13 +3,88 @@ SQL Agent 核心模块
 参考 LangChain 官方文档简化实现
 """
 import os
-from typing import Optional, Dict, Any, Callable
+import json
+from typing import Optional, Dict, Any, Callable, List, Optional as TypingOptional
 from langchain_community.utilities import SQLDatabase
 from langchain_community.chat_models import ChatTongyi
 from langchain_community.agent_toolkits import create_sql_agent
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.callbacks import BaseCallbackHandler
 
 from .config import Config
+
+
+class AgentTraceHandler(BaseCallbackHandler):
+    """捕获 Agent 工具调用过程（用于前端展示）并提取 SQL。"""
+
+    def __init__(self) -> None:
+        self.sql_queries: List[str] = []
+        self.trace: List[Dict[str, Any]] = []
+        self._run_id_to_index: Dict[str, int] = {}
+
+    @staticmethod
+    def _normalize_input(value: Any) -> str:
+        """将工具输入尽量规范化为可展示的字符串。"""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            # 常见字段：query / tool_input / table_names
+            if "query" in value and isinstance(value["query"], str):
+                return value["query"].strip()
+            if "tool_input" in value and isinstance(value["tool_input"], str):
+                return value["tool_input"].strip()
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2)
+            except Exception:
+                return str(value)
+        return str(value).strip()
+
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: Any = None, **kwargs) -> None:
+        """工具开始执行时触发。"""
+        tool_name = (serialized or {}).get("name") or kwargs.get("name") or ""
+        run_id = str(kwargs.get("run_id") or "")
+
+        normalized_input = self._normalize_input(input_str if input_str is not None else kwargs.get("input"))
+
+        # 记录 trace
+        entry: Dict[str, Any] = {
+            "tool": tool_name,
+            "input": normalized_input,
+            "output": None,
+        }
+        self.trace.append(entry)
+        if run_id:
+            self._run_id_to_index[run_id] = len(self.trace) - 1
+
+        # 捕获 SQL
+        if tool_name == "sql_db_query":
+            if normalized_input:
+                self.sql_queries.append(normalized_input)
+
+    def on_tool_end(self, output: Any, **kwargs) -> None:
+        """工具执行结束时触发。"""
+        run_id = str(kwargs.get("run_id") or "")
+        normalized_output = self._normalize_input(output)
+
+        idx: TypingOptional[int] = self._run_id_to_index.get(run_id) if run_id else None
+        if idx is None:
+            # 找不到 run_id 时，兜底：给最后一个尚未填充 output 的条目
+            for i in range(len(self.trace) - 1, -1, -1):
+                if self.trace[i].get("output") is None:
+                    idx = i
+                    break
+        if idx is not None:
+            self.trace[idx]["output"] = normalized_output
+
+    def on_tool_error(self, error: Exception, **kwargs) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        idx = self._run_id_to_index.get(run_id) if run_id else None
+        if idx is None and self.trace:
+            idx = len(self.trace) - 1
+        if idx is not None:
+            self.trace[idx]["output"] = f"Error: {error}"
 
 
 class SQLAgent:
@@ -27,31 +102,19 @@ class SQLAgent:
         Returns:
             System Prompt 字符串
         """
-        return f"""You are a careful MySQL analyst.
+        return f"""你是一名严谨的 MySQL 数据分析助手。
 
-Authoritative schema (do not invent columns/tables):
-
+【权威 Schema（严禁臆造表/字段）】
 {schema_info}
 
-Rules:
-
-- Think step-by-step.
-
-- When you need data, call the tool `sql_db_query` with ONE SELECT query.
-
-- Read-only only; no INSERT/UPDATE/DELETE/ALTER/DROP/CREATE/REPLACE/TRUNCATE.
-
-- Limit to {default_limit} rows unless user explicitly asks otherwise.
-
-- If the tool returns 'Error:', revise the SQL and try again.
-
-- Limit the number of attempts to 5.
-
-- If you are not successful after 5 attempts, return a note to the user.
-
-- Prefer explicit column lists; avoid SELECT *.
-
-- Response in Chinese.
+【规则】
+- 你需要查询数据时，只能调用工具 `sql_db_query`，并且一次只提交 **一条 SELECT** 查询。
+- 只读：禁止 INSERT / UPDATE / DELETE / ALTER / DROP / CREATE / REPLACE / TRUNCATE 等写操作。
+- 除非用户明确要求更多，否则默认最多返回 {default_limit} 行。
+- 如果工具返回 Error，请修正 SQL 后再重试。
+- 最多尝试 5 次；若仍失败，向用户说明原因并给出建议。
+- 尽量写明列名，避免 SELECT *。
+- 最终回答必须使用中文。
 """
     """SQL Agent 主类"""
     
@@ -63,7 +126,7 @@ Rules:
         max_iterations: Optional[int] = None,
         verbose: Optional[bool] = None,
         agent_type: Optional[str] = None,
-        default_limit: int = 5,
+        default_limit: int = Config.DEFAULT_LIMIT,
         system_prompt: Optional[str] = None
     ):
         """
@@ -144,7 +207,7 @@ Rules:
         # 保存 system prompt 供查看
         self.system_prompt = system_prompt
     
-    def query(self, question: str) -> Dict[str, Any]:
+    def query(self, question: str, callbacks: Optional[List[BaseCallbackHandler]] = None) -> Dict[str, Any]:
         """
         执行自然语言查询
         
@@ -152,21 +215,46 @@ Rules:
             question: 用户问题（作为 user prompt 传入）
         
         Returns:
-            查询结果字典
+            查询结果字典，包含：
+            - success: 是否成功
+            - question: 用户问题
+            - answer: AI回答
+            - sql: 生成的SQL语句（如果有）
+            - database: 数据库名称
         
         注意：
             - System Prompt: 由 create_sql_agent 内部自动生成，包含数据库 Schema 和规则
             - User Prompt: 通过 {"input": question} 传入，即用户的问题
         """
+        # 创建 Trace 捕获处理器（工具调用过程 + SQL）
+        trace_handler = AgentTraceHandler()
+        extra_callbacks = callbacks or []
+        callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
+        
         try:
-            # User Prompt 在这里：{"input": question}
-            result = self.agent_executor.invoke({"input": question})
-            return {
+            # 使用回调处理器来捕获工具调用过程与SQL
+            result = self.agent_executor.invoke(
+                {"input": question},
+                config={"callbacks": callbacks_list}
+            )
+            
+            response = {
                 "success": True,
                 "question": question,
                 "answer": result.get("output", ""),
                 "database": self.db_name
             }
+            
+            # 如果捕获到工具调用过程，返回给前端展示（可折叠）
+            if trace_handler.trace:
+                response["trace"] = trace_handler.trace
+
+            # 如果捕获到SQL，添加到返回结果中（用于专门的SQL下拉框）
+            if trace_handler.sql_queries:
+                response["sql"] = "\n\n".join(trace_handler.sql_queries)
+            
+            return response
+            
         except Exception as e:
             return {
                 "success": False,
@@ -174,6 +262,83 @@ Rules:
                 "error": str(e),
                 "database": self.db_name
             }
+
+    def run_tools(self, question: str, callbacks: Optional[List[BaseCallbackHandler]] = None) -> Dict[str, Any]:
+        """
+        只运行“工具调用/SQL执行”阶段，返回 SQL、工具 trace、以及最后一次 SQL 查询结果（字符串）。
+        用于：先拿到 SQL 再开始流式生成最终回答。
+        """
+        trace_handler = AgentTraceHandler()
+        extra_callbacks = callbacks or []
+        callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
+
+        try:
+            result = self.agent_executor.invoke(
+                {"input": question},
+                config={"callbacks": callbacks_list},
+            )
+
+            sql_text = "\n\n".join(trace_handler.sql_queries) if trace_handler.sql_queries else ""
+
+            # 找到最后一次 sql_db_query 的输出（作为最终回答的依据）
+            last_sql_output = ""
+            for step in reversed(trace_handler.trace):
+                if step.get("tool") == "sql_db_query" and step.get("output"):
+                    last_sql_output = step.get("output", "")
+                    break
+
+            return {
+                "success": True,
+                "question": question,
+                "database": self.db_name,
+                "trace": trace_handler.trace,
+                "sql": sql_text,
+                "sql_output": last_sql_output,
+                # 保留 agent 原始 output 以便兜底
+                "agent_output": result.get("output", ""),
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "question": question,
+                "database": self.db_name,
+                "error": str(e),
+            }
+
+    def stream_final_answer(
+        self,
+        question: str,
+        sql: str,
+        sql_output: str,
+        callbacks: Optional[List[BaseCallbackHandler]] = None,
+    ) -> str:
+        """
+        仅流式生成“最终回答”。工具阶段已完成后调用本方法。
+        """
+        final_llm = ChatTongyi(
+            model_name=Config.MODEL_NAME,
+            temperature=Config.TEMPERATURE,
+            streaming=True,
+            callbacks=callbacks or [],
+        )
+
+        system = SystemMessage(
+            content=(
+                "你是财务数据分析助手。请根据用户问题、SQL 以及 SQL 返回结果，用中文给出清晰、准确的最终回答。\n"
+                "要求：不要输出推理过程，不要输出工具调用痕迹；必要时用项目符号列出结果。"
+            )
+        )
+        human = HumanMessage(
+            content=(
+                f"【用户问题】\n{question}\n\n"
+                f"【生成的SQL】\n{sql or '(无)'}\n\n"
+                f"【SQL返回结果】\n{sql_output or '(无)'}\n\n"
+                "请给出最终回答："
+            )
+        )
+        msg = final_llm.invoke([system, human])
+        # Chat message -> content
+        return getattr(msg, "content", str(msg))
     
     def get_schema_info(self) -> Dict[str, Any]:
         """
