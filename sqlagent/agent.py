@@ -88,7 +88,19 @@ Rules:
             raise ValueError("数据库名称未指定，请设置 DB_NAME 环境变量或传入 db_name 参数")
         
         db_uri = Config.get_db_uri(target_db)
-        self.db = SQLDatabase.from_uri(db_uri)
+        
+        # 配置连接池参数，提升连接性能和稳定性
+        engine_args = {
+            "pool_pre_ping": True,      # 使用前检测连接，自动处理断线
+            "pool_size": 5,              # 连接池大小
+            "max_overflow": 10,          # 最大溢出连接数
+            "pool_recycle": 3600,        # 1小时回收连接
+            "connect_args": {
+                "connect_timeout": 10    # 连接超时10秒
+            }
+        }
+        
+        self.db = SQLDatabase.from_uri(db_uri, engine_args=engine_args)
         self.db_name = target_db
         self.default_limit = default_limit
         

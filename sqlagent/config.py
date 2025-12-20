@@ -62,11 +62,24 @@ class Config:
     
     @classmethod
     def get_db_uri(cls, db_name: Optional[str] = None) -> str:
-        """获取数据库连接URI"""
+        """
+        获取数据库连接URI（带连接池配置）
+        
+        连接池参数说明：
+        - pool_pre_ping=true: 连接使用前先测试，自动处理断线
+        - pool_size=5: 连接池大小
+        - pool_recycle=3600: 1小时回收连接，防止超时
+        - max_overflow=10: 最大溢出连接数
+        """
         target_db = db_name or cls.DB_NAME
         if target_db is None:
             raise ValueError("数据库名称未指定，请设置 DB_NAME 环境变量或传入 db_name 参数")
-        return f"mysql+pymysql://{cls.DB_USER}:{cls.DB_PASSWORD}@{cls.DB_HOST}:{cls.DB_PORT}/{target_db}"
+        
+        # 基础连接字符串
+        base_uri = f"mysql+pymysql://{cls.DB_USER}:{cls.DB_PASSWORD}@{cls.DB_HOST}:{cls.DB_PORT}/{target_db}"
+        
+        # 添加连接池参数（通过 engine_options 在 SQLDatabase.from_uri 中使用）
+        return base_uri + "?charset=utf8mb4"
     
     @classmethod
     def get_available_databases(cls) -> list:

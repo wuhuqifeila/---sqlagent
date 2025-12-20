@@ -18,19 +18,30 @@ st.set_page_config(
     layout="wide"
 )
 
+# 使用 @st.cache_resource 缓存 Agent 对象（跨会话共享，刷新页面不重新初始化）
+@st.cache_resource
+def get_sql_agent(db_name: str = None):
+    """
+    获取缓存的 SQL Agent 对象
+    使用 @st.cache_resource 使连接在所有用户会话间共享
+    刷新页面或新标签页都不会重新初始化
+    """
+    return SQLAgent(db_name=db_name)
+
 # 初始化 session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "agent" not in st.session_state:
-    try:
-        # 显示加载提示
-        with st.spinner("🔄 正在连接云端数据库并初始化Agent..."):
-            st.session_state.agent = SQLAgent()
-            st.session_state.db_name = Config.DB_NAME
-    except Exception as e:
-        st.error(f"初始化 Agent 失败: {e}")
-        st.stop()
+if "db_name" not in st.session_state:
+    st.session_state.db_name = Config.DB_NAME
+
+# 获取缓存的 Agent（首次加载会显示加载提示）
+try:
+    with st.spinner("🔄 正在连接云端数据库并初始化Agent..."):
+        agent = get_sql_agent(st.session_state.db_name)
+except Exception as e:
+    st.error(f"初始化 Agent 失败: {e}")
+    st.stop()
 
 # 侧边栏配置
 with st.sidebar:
@@ -51,9 +62,10 @@ with st.sidebar:
         
         if selected_db != st.session_state.db_name:
             with st.spinner(f"切换到数据库 {selected_db}..."):
-                st.session_state.agent.switch_database(selected_db)
+                # 清除缓存，重新获取新数据库的 Agent
+                get_sql_agent.clear()
                 st.session_state.db_name = selected_db
-            st.success(f"已切换到: {selected_db}")
+                st.rerun()  # 重新运行以使用新的数据库
     except Exception as e:
         st.error(f"获取数据库列表失败: {e}")
     
@@ -62,7 +74,7 @@ with st.sidebar:
     # 显示当前数据库信息
     st.subheader("📊 数据库信息")
     if st.button("查看 Schema"):
-        schema_info = st.session_state.agent.get_schema_info()
+        schema_info = agent.get_schema_info()
         st.write(f"**数据库**: {schema_info['database']}")
         st.write(f"**表列表**: {', '.join(schema_info['tables'])}")
         with st.expander("详细结构"):
@@ -97,7 +109,7 @@ if prompt := st.chat_input("请输入您的问题..."):
     # 显示加载状态
     with st.chat_message("assistant"):
         with st.spinner("正在查询..."):
-            result = st.session_state.agent.query(prompt)
+            result = agent.query(prompt)
         
         if result["success"]:
             st.markdown(result["answer"])
