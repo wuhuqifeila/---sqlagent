@@ -422,26 +422,13 @@ if prompt := st.chat_input("请输入您的问题..."):
             else:
                 st.caption("⚠️ 未捕获到可用于展示的数据查询 SQL（last_sql 为空）。")
 
-            # 第2阶段：只流式输出“最终回答”
-            answer_placeholder = st.empty()
-            answer_stream_handler = StreamlitAnswerStreamHandler(answer_placeholder)
-            # 给模型：总行数 + 前 20 行样例（硬上限），而不是全量数据
-            max_preview_rows = 20
+            # 不再调用大模型生成“最终总结回复”，改为固定模板（零额外 token）
             total_rows = int(df.shape[0]) if "df" in locals() and isinstance(df, pd.DataFrame) else None
-            preview_text = df_preview_text(df, n=max_preview_rows) if "df" in locals() and isinstance(df, pd.DataFrame) else None
-
-            final_answer = agent.stream_final_answer(
-                question=prompt,
-                sql=tool_result.get("sql", ""),
-                sql_output=tool_result.get("sql_output", ""),
-                total_rows=total_rows,
-                preview_rows_text=preview_text,
-                max_preview_rows=max_preview_rows,
-                callbacks=[answer_stream_handler],
-            )
-            # 确保页面上是完整文本
-            streamed_text = answer_stream_handler.flush()
-            final_answer = streamed_text or final_answer
+            if total_rows is not None:
+                final_answer = f"查询完成，共 {total_rows} 行结果。明细请查看上方表格，或点击下方按钮下载全量 Excel。"
+            else:
+                final_answer = "查询完成。明细请查看上方表格，或点击下方按钮下载全量 Excel。"
+            st.markdown(final_answer)
 
             # 保存到消息历史（用于刷新后仍可见）
             message_data = {
