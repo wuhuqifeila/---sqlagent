@@ -4,6 +4,8 @@ SQL Agent 核心模块
 """
 import os
 import json
+import ast
+import re
 from typing import Optional, Dict, Any, Callable, List, Optional as TypingOptional
 from langchain_community.utilities import SQLDatabase
 from langchain_community.chat_models import ChatTongyi
@@ -28,7 +30,19 @@ class AgentTraceHandler(BaseCallbackHandler):
         if value is None:
             return ""
         if isinstance(value, str):
-            return value.strip()
+            s = value.strip()
+            # 兼容某些版本里把 {"query": "..."} 以字符串形式传入的情况
+            if s.startswith("{") and "query" in s:
+                try:
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("query"), str):
+                        return parsed["query"].strip()
+                except Exception:
+                    # 再兜底一次：用正则提取 query
+                    m = re.search(r"""['"]query['"]\s*:\s*['"]([\s\S]*?)['"]\s*\}?$""", s)
+                    if m:
+                        return m.group(1).strip()
+            return s
         if isinstance(value, dict):
             # 常见字段：query / tool_input / table_names
             if "query" in value and isinstance(value["query"], str):
@@ -115,6 +129,13 @@ class SQLAgent:
 - 最多尝试 5 次；若仍失败，向用户说明原因并给出建议。
 - 尽量写明列名，避免 SELECT *。
 - 最终回答必须使用中文。
+
+【强制约束（必须遵守）】
+- 你在最终回答中不得直接逐条列出大量记录。
+- 即使用户要求“全部”，最终回答也只能提供：
+  1) 总数量/汇总统计
+  2) 代表性的前 N 条示例（N 有硬上限）
+  3) 引导用户到页面下方表格/下载查看全量结果
 """
     """SQL Agent 主类"""
     
@@ -279,6 +300,7 @@ class SQLAgent:
             )
 
             sql_text = "\n\n".join(trace_handler.sql_queries) if trace_handler.sql_queries else ""
+            last_sql = trace_handler.sql_queries[-1].strip() if trace_handler.sql_queries else ""
 
             # 找到最后一次 sql_db_query 的输出（作为最终回答的依据）
             last_sql_output = ""
@@ -293,6 +315,7 @@ class SQLAgent:
                 "database": self.db_name,
                 "trace": trace_handler.trace,
                 "sql": sql_text,
+                "last_sql": last_sql,
                 "sql_output": last_sql_output,
                 # 保留 agent 原始 output 以便兜底
                 "agent_output": result.get("output", ""),
@@ -310,6 +333,10 @@ class SQLAgent:
         question: str,
         sql: str,
         sql_output: str,
+        *,
+        total_rows: Optional[int] = None,
+        preview_rows_text: Optional[str] = None,
+        max_preview_rows: int = 20,
         callbacks: Optional[List[BaseCallbackHandler]] = None,
     ) -> str:
         """
@@ -324,16 +351,22 @@ class SQLAgent:
 
         system = SystemMessage(
             content=(
-                "你是财务数据分析助手。请根据用户问题、SQL 以及 SQL 返回结果，用中文给出清晰、准确的最终回答。\n"
-                "要求：不要输出推理过程，不要输出工具调用痕迹；必要时用项目符号列出结果。"
+                "你是财务数据分析助手。请根据用户问题、SQL 以及查询结果信息，用中文给出清晰、准确的最终回答。\n"
+                "要求：不要输出推理过程，不要输出工具调用痕迹。\n"
+                "【强制约束（必须遵守）】\n"
+                "- 最终回答**只输出一段中文总结**（允许分句，但不要用列表/表格/逐行罗列）。\n"
+                "- 不得逐条列出记录明细，不得输出表格，不得输出逐行列表。\n"
+                "- 即使用户要求“全部”，也只允许做汇总性的说明，并引导用户到页面下方表格/下载查看全量结果。\n"
             )
         )
         human = HumanMessage(
             content=(
                 f"【用户问题】\n{question}\n\n"
                 f"【生成的SQL】\n{sql or '(无)'}\n\n"
-                f"【SQL返回结果】\n{sql_output or '(无)'}\n\n"
-                "请给出最终回答："
+                f"【查询结果总行数】\n{total_rows if total_rows is not None else '(未知)'}\n\n"
+                f"【结果样例（最多 {max_preview_rows} 行，仅供你总结用，不要逐条复述）】\n{preview_rows_text or '(无样例)'}\n\n"
+                f"【原始SQL返回结果（可能已截断/不完整）】\n{sql_output or '(无)'}\n\n"
+                "请给出最终回答（只写一段总结，不要列数据，不要列表）："
             )
         )
         msg = final_llm.invoke([system, human])
