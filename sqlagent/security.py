@@ -6,7 +6,10 @@ import re
 from typing import Optional
 
 
-def sanitize_sql_query(query: str, default_limit: int = 5) -> str:
+MAX_HARD_LIMIT = 20
+
+
+def sanitize_sql_query(query: str, default_limit: int = 20, hard_limit: int = MAX_HARD_LIMIT) -> str:
     """
     清理和验证 SQL 查询语句
     
@@ -38,29 +41,41 @@ def sanitize_sql_query(query: str, default_limit: int = 5) -> str:
     # 移除末尾的分号（如果有）
     query = query.rstrip(';').strip()
     
+    # 计算本次有效限制：用户给的 default_limit 也不允许超过 hard_limit
+    effective_limit = min(int(default_limit), int(hard_limit))
+
     # 检查是否已有 LIMIT
     if "LIMIT" not in query.upper():
         # 检查是否有 ORDER BY，如果有则在 ORDER BY 之后添加 LIMIT
         order_by_match = re.search(r"\bORDER\s+BY\b", query, re.IGNORECASE)
         if order_by_match:
             # 在 ORDER BY 子句后添加 LIMIT
-            query = query + f" LIMIT {default_limit}"
+            query = query + f" LIMIT {effective_limit}"
         else:
             # 如果没有 ORDER BY，直接在末尾添加 LIMIT
-            query = query + f" LIMIT {default_limit}"
+            query = query + f" LIMIT {effective_limit}"
     else:
-        # 如果已有 LIMIT，检查是否超过默认限制
-        limit_match = re.search(r"LIMIT\s+(\d+)", query, re.IGNORECASE)
-        if limit_match:
-            limit_value = int(limit_match.group(1))
-            if limit_value > default_limit * 10:  # 允许最多10倍默认值
-                # 替换为安全限制
-                query = re.sub(
-                    r"LIMIT\s+\d+",
-                    f"LIMIT {default_limit * 10}",
-                    query,
-                    flags=re.IGNORECASE
-                )
+        # 如果已有 LIMIT，强制不超过 hard_limit（且不超过 effective_limit）
+        # 支持 LIMIT n / LIMIT offset, n / LIMIT n OFFSET offset
+        m1 = re.search(r"(?is)\bLIMIT\s+(\d+)\s*,\s*(\d+)\b", query)
+        if m1:
+            offset = int(m1.group(1))
+            count = int(m1.group(2))
+            count2 = min(count, effective_limit)
+            query = re.sub(r"(?is)\bLIMIT\s+\d+\s*,\s*\d+\b", f"LIMIT {offset}, {count2}", query)
+        else:
+            m2 = re.search(r"(?is)\bLIMIT\s+(\d+)\s+OFFSET\s+(\d+)\b", query)
+            if m2:
+                count = int(m2.group(1))
+                offset = int(m2.group(2))
+                count2 = min(count, effective_limit)
+                query = re.sub(r"(?is)\bLIMIT\s+\d+\s+OFFSET\s+\d+\b", f"LIMIT {count2} OFFSET {offset}", query)
+            else:
+                m3 = re.search(r"(?is)\bLIMIT\s+(\d+)\b", query)
+                if m3:
+                    count = int(m3.group(1))
+                    count2 = min(count, effective_limit)
+                    query = re.sub(r"(?is)\bLIMIT\s+\d+\b", f"LIMIT {count2}", query, count=1)
     
     return query + ";"
 

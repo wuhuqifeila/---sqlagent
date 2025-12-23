@@ -172,8 +172,8 @@ def auto_echarts_option(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if df is None or df.empty:
         return None
 
-    # 仅取前 200 行用于绘图，避免图表过重
-    d = df.copy().head(200)
+    # 绘图最多使用 20 行（与结果限制一致）
+    d = df.copy().head(20)
 
     # 尝试识别时间列
     datetime_cols: List[str] = []
@@ -322,7 +322,8 @@ for message in st.session_state.messages:
         if message["role"] == "assistant" and message.get("last_sql"):
             try:
                 df_hist = get_df_for_sql(st.session_state.db_name, message["last_sql"])
-                PREVIEW_ROWS = 20
+                effective_limit = int(message.get("effective_limit") or 20)
+                PREVIEW_ROWS = min(effective_limit, 20)
                 preview_df = df_hist.head(PREVIEW_ROWS)
                 if len(df_hist) <= PREVIEW_ROWS:
                     st.markdown(f"**📄 查询结果（共 {len(df_hist)} 行，已全部展示）**")
@@ -388,7 +389,8 @@ if prompt := st.chat_input("请输入您的问题..."):
                     engine = get_sqlalchemy_engine(st.session_state.db_name)
                     df = execute_sql_to_df(last_sql, engine)
 
-                    PREVIEW_ROWS = 20
+                    effective_limit = int(tool_result.get("effective_limit") or 20)
+                    PREVIEW_ROWS = min(effective_limit, 20)
                     preview_df = df.head(PREVIEW_ROWS)
                     if len(df) <= PREVIEW_ROWS:
                         st.markdown(f"**📄 查询结果（共 {len(df)} 行，已全部展示）**")
@@ -441,6 +443,7 @@ if prompt := st.chat_input("请输入您的问题..."):
             # 保存 last_sql，用于 rerun 后重绘表格/下载/图表
             if tool_result.get("last_sql"):
                 message_data["last_sql"] = tool_result["last_sql"]
+            message_data["effective_limit"] = int(tool_result.get("effective_limit") or 20)
             
             st.session_state.messages.append(message_data)
         else:

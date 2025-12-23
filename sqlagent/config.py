@@ -52,12 +52,12 @@ class Config:
     STREAMING: bool = str(get_config_value("STREAMING", "False")).lower() == "true"
     
     # Agent 配置
-    MAX_ITERATIONS: int = int(get_config_value("MAX_ITERATIONS", "5"))
+    MAX_ITERATIONS: int = int(get_config_value("MAX_ITERATIONS", "10"))
     VERBOSE: bool = str(get_config_value("VERBOSE", "True")).lower() == "true"
     AGENT_TYPE: str = get_config_value("AGENT_TYPE", "openai-tools")
     
     # 安全配置
-    DEFAULT_LIMIT: int = int(get_config_value("DEFAULT_LIMIT", "10"))
+    DEFAULT_LIMIT: int = int(get_config_value("DEFAULT_LIMIT", "20"))
     ENABLE_HUMAN_IN_LOOP: bool = str(get_config_value("ENABLE_HUMAN_IN_LOOP", "False")).lower() == "true"
     
     @classmethod

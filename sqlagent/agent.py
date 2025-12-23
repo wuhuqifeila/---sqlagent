@@ -14,6 +14,57 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.callbacks import BaseCallbackHandler
 
 from .config import Config
+from .security import sanitize_sql_query
+
+
+MAX_HARD_LIMIT = 20
+
+
+def _chinese_num_to_int(s: str) -> Optional[int]:
+    """支持 1-99 的中文数字（含“十/二十/二十一”）。"""
+    s = s.strip()
+    if not s:
+        return None
+    mapping = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if s == "十":
+        return 10
+    if "十" in s:
+        left, _, right = s.partition("十")
+        tens = 1 if left == "" else mapping.get(left)
+        if tens is None:
+            return None
+        ones = 0 if right == "" else mapping.get(right)
+        if ones is None:
+            return None
+        return tens * 10 + ones
+    if len(s) == 1 and s in mapping:
+        return mapping[s]
+    return None
+
+
+def extract_requested_limit(question: str, hard_cap: int = MAX_HARD_LIMIT) -> int:
+    """
+    从用户问题中抽取希望返回的行数 N（若未指定则默认 hard_cap），并强制不超过 hard_cap。
+    支持：前10/Top10/只要5条/限制20行/返回十条 等。
+    """
+    q = (question or "").strip()
+    if not q:
+        return hard_cap
+
+    # 先找阿拉伯数字
+    m = re.search(r"(?i)(?:top|前|最多|只要|限制|返回|显示|取)\s*(\d{1,4})\s*(?:条|行)?", q)
+    if m:
+        n = int(m.group(1))
+        return max(1, min(n, hard_cap))
+
+    # 再找中文数字（十/二十/二十一等）
+    m2 = re.search(r"(?:top|前|最多|只要|限制|返回|显示|取)\s*([一二两三四五六七八九十]{1,3})\s*(?:条|行)?", q)
+    if m2:
+        n2 = _chinese_num_to_int(m2.group(1))
+        if n2 is not None:
+            return max(1, min(n2, hard_cap))
+
+    return hard_cap
 
 
 class AgentTraceHandler(BaseCallbackHandler):
@@ -126,16 +177,9 @@ class SQLAgent:
 - 只读：禁止 INSERT / UPDATE / DELETE / ALTER / DROP / CREATE / REPLACE / TRUNCATE 等写操作。
 - 除非用户明确要求更多，否则默认最多返回 {default_limit} 行。
 - 如果工具返回 Error，请修正 SQL 后再重试。
-- 最多尝试 5 次；若仍失败，向用户说明原因并给出建议。
+- 最多尝试 10 次；若仍失败，向用户说明原因并给出建议。
 - 尽量写明列名，避免 SELECT *。
 - 最终回答必须使用中文。
-
-【强制约束（必须遵守）】
-- 你在最终回答中不得直接逐条列出大量记录。
-- 即使用户要求“全部”，最终回答也只能提供：
-  1) 总数量/汇总统计
-  2) 代表性的前 20 条示例
-  3) 引导用户到页面下方表格/下载查看全量结果
 """
     """SQL Agent 主类"""
     
@@ -187,6 +231,11 @@ class SQLAgent:
         self.db = SQLDatabase.from_uri(db_uri, engine_args=engine_args)
         self.db_name = target_db
         self.default_limit = default_limit
+        # 当前问题的有效 LIMIT（每次 query/run_tools 时更新），用于强制钳制 sql_db_query 的返回行数
+        self._effective_limit: int = min(int(default_limit), MAX_HARD_LIMIT)
+
+        # Monkey-patch：强制限制 sql_db_query 实际执行的 SQL 行数（不依赖提示词）
+        self._patch_db_limit()
         
         # LLM 初始化
         self.llm = ChatTongyi(
@@ -227,6 +276,32 @@ class SQLAgent:
         
         # 保存 system prompt 供查看
         self.system_prompt = system_prompt
+
+    def _patch_db_limit(self) -> None:
+        """拦截 SQLDatabase.run / run_no_throw，在执行前强制追加/收缩 LIMIT（≤20）。"""
+        if not hasattr(self, "db") or self.db is None:
+            return
+
+        db = self.db
+
+        def _wrap_run(fn):
+            # fn 是“已绑定方法”（bound method），直接调用即可；不要再用 MethodType 二次绑定
+            def _inner(command: str, *args, **kwargs):
+                try:
+                    # 只对 SELECT 做限流；sanitize_sql_query 内部也会拒绝非 SELECT
+                    limited = sanitize_sql_query(command, default_limit=self._effective_limit)
+                except Exception:
+                    # 若 sanitize 失败，仍执行原 SQL（避免影响 list/schema 等非 SELECT 场景）
+                    limited = command
+                return fn(limited, *args, **kwargs)
+            return _inner
+
+        if hasattr(db, "run") and callable(getattr(db, "run")):
+            original_run = db.run  # bound method
+            db.run = _wrap_run(original_run)  # type: ignore
+        if hasattr(db, "run_no_throw") and callable(getattr(db, "run_no_throw")):
+            original_run_no_throw = db.run_no_throw  # bound method
+            db.run_no_throw = _wrap_run(original_run_no_throw)  # type: ignore
     
     def query(self, question: str, callbacks: Optional[List[BaseCallbackHandler]] = None) -> Dict[str, Any]:
         """
@@ -251,6 +326,9 @@ class SQLAgent:
         trace_handler = AgentTraceHandler()
         extra_callbacks = callbacks or []
         callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
+
+        # 每轮根据用户输入计算有效 LIMIT（≤20），用于强制钳制 sql_db_query 返回行数
+        self._effective_limit = extract_requested_limit(question, hard_cap=MAX_HARD_LIMIT)
         
         try:
             # 使用回调处理器来捕获工具调用过程与SQL
@@ -293,6 +371,9 @@ class SQLAgent:
         extra_callbacks = callbacks or []
         callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
 
+        # 每轮根据用户输入计算有效 LIMIT（≤20），用于强制钳制 sql_db_query 返回行数
+        self._effective_limit = extract_requested_limit(question, hard_cap=MAX_HARD_LIMIT)
+
         try:
             result = self.agent_executor.invoke(
                 {"input": question},
@@ -313,6 +394,7 @@ class SQLAgent:
                 "success": True,
                 "question": question,
                 "database": self.db_name,
+                "effective_limit": self._effective_limit,
                 "trace": trace_handler.trace,
                 "sql": sql_text,
                 "last_sql": last_sql,
