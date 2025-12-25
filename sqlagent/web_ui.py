@@ -13,11 +13,13 @@ import time
 import pandas as pd
 from sqlalchemy import create_engine
 import hashlib
+import re
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlagent import SQLAgent, Config
+from sqlagent.security import sanitize_sql_query, MAX_HARD_LIMIT
 
 # ECharts（可选依赖，未安装时自动降级不显示图表）
 try:
@@ -143,6 +145,54 @@ def stable_key_for_sql(db_name: str, sql: str) -> str:
     raw = (db_name + "\n" + (sql or "")).encode("utf-8", errors="ignore")
     return hashlib.md5(raw).hexdigest()
 
+def build_df_info_for_viz(df: pd.DataFrame, max_rows: int = 20) -> Dict[str, Any]:
+    """给 LLM 用的可视化上下文：避免塞全量，提供列类型/基数/样例/简单统计。"""
+    if df is None or df.empty:
+        return {"row_count": 0, "columns": [], "sample_rows": []}
+
+    d = df.copy().head(max_rows)
+
+    cols_info: List[Dict[str, Any]] = []
+    for c in d.columns:
+        s = d[c]
+        # 基本类型
+        if pd.api.types.is_numeric_dtype(s):
+            col_type = "number"
+        elif pd.api.types.is_datetime64_any_dtype(s):
+            col_type = "datetime"
+        else:
+            col_type = "string"
+
+        nunique = int(s.astype(str).nunique(dropna=True))
+        cols_info.append(
+            {
+                "name": str(c),
+                "type": col_type,
+                "nunique": nunique,
+            }
+        )
+
+    # 样例行：转成纯 Python 类型，避免 datetime/decimal 序列化问题
+    sample_rows = d.astype(str).to_dict(orient="records")
+
+    # 数值列简单统计
+    num_cols = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
+    numeric_summary: Dict[str, Any] = {}
+    for c in num_cols[:5]:
+        s = pd.to_numeric(d[c], errors="coerce")
+        numeric_summary[str(c)] = {
+            "min": float(s.min()) if s.notna().any() else None,
+            "max": float(s.max()) if s.notna().any() else None,
+            "mean": float(s.mean()) if s.notna().any() else None,
+        }
+
+    return {
+        "row_count": int(len(df)),
+        "columns": cols_info,
+        "sample_rows": sample_rows,
+        "numeric_summary": numeric_summary,
+        "note": f"sample_rows 仅为前 {max_rows} 行，用于选图；真实结果行数见 row_count。",
+    }
 
 def execute_sql_to_df(sql: str, engine) -> pd.DataFrame:
     """
@@ -165,6 +215,37 @@ def execute_sql_to_df(sql: str, engine) -> pd.DataFrame:
             conn.close()
         except Exception:
             pass
+
+
+def execute_scalar(sql: str, engine) -> Any:
+    """执行返回单个值的 SQL（例如 COUNT(*)）。"""
+    q = (sql or "").strip().rstrip(";")
+    if not q:
+        return None
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(q)
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def strip_trailing_limit(sql: str) -> str:
+    """
+    去除末尾 LIMIT 子句（仅处理末尾的 LIMIT n / LIMIT offset,n / LIMIT n OFFSET offset）。
+    用于计算“全量行数”COUNT(*)。
+    """
+    s = (sql or "").strip().rstrip(";")
+    # 移除末尾 LIMIT ...（尽量不影响子查询内 LIMIT）
+    s = re.sub(r"(?is)\s+limit\s+\d+\s*,\s*\d+\s*$", "", s)
+    s = re.sub(r"(?is)\s+limit\s+\d+\s+offset\s+\d+\s*$", "", s)
+    s = re.sub(r"(?is)\s+limit\s+\d+\s*$", "", s)
+    return s.strip()
 
 
 def auto_echarts_option(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -254,6 +335,12 @@ if "messages" not in st.session_state:
 if "db_name" not in st.session_state:
     st.session_state.db_name = Config.DB_NAME
 
+# 用于更顺滑的“运行中禁用输入框”体验（两段式 rerun）
+if "pending_prompt" not in st.session_state:
+    st.session_state.pending_prompt = None
+if "is_running" not in st.session_state:
+    st.session_state.is_running = False
+
 # 获取缓存的 Agent（首次加载会显示加载提示）
 try:
     with st.spinner("🔄 正在连接云端数据库并初始化Agent..."):
@@ -321,7 +408,11 @@ for message in st.session_state.messages:
         # 如果历史消息里有 last_sql，则重绘“表格 + 下载 + 图表”
         if message["role"] == "assistant" and message.get("last_sql"):
             try:
-                df_hist = get_df_for_sql(st.session_state.db_name, message["last_sql"])
+                # 历史重绘也走统一 LIMIT 规则（≤20）
+                eff = int(message.get("effective_limit") or 20)
+                eff = max(1, min(eff, MAX_HARD_LIMIT))
+                limited_sql = sanitize_sql_query(message["last_sql"], default_limit=eff, hard_limit=MAX_HARD_LIMIT)
+                df_hist = get_df_for_sql(st.session_state.db_name, limited_sql)
                 effective_limit = int(message.get("effective_limit") or 20)
                 PREVIEW_ROWS = min(effective_limit, 20)
                 preview_df = df_hist.head(PREVIEW_ROWS)
@@ -344,10 +435,21 @@ for message in st.session_state.messages:
                 )
 
                 if HAS_ECHARTS:
-                    option = auto_echarts_option(df_hist)
-                    if option:
-                        st.markdown("**📊 可视化（ECharts）**")
-                        st_echarts(option, height="420px", key=f"chart-{dl_key}")
+                    # LLM 生成 option（若失败/不适合会返回 show=false）
+                    try:
+                        df_info = build_df_info_for_viz(df_hist, max_rows=20)
+                        viz = agent.generate_echarts_option(
+                            question="(历史消息重绘)",
+                            sql=message.get("last_sql", ""),
+                            df_info=df_info,
+                        )
+                        if viz.get("show") and isinstance(viz.get("option"), dict):
+                            st.markdown("**📊 可视化（ECharts）**")
+                            st_echarts(viz["option"], height="420px", key=f"chart-{dl_key}")
+                        else:
+                            st.caption(f"📊 不展示图表：{viz.get('reason', '数据不适合')}")
+                    except Exception as e:
+                        st.caption(f"📊 图表生成失败：{e}")
             except Exception as e:
                 st.caption(f"⚠️ 查询结果展示失败：{e}")
         
@@ -355,51 +457,75 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # 输入框
-if prompt := st.chat_input("请输入您的问题..."):
-    # 添加用户消息
+# 输入框（运行中禁用，并提示“正在运行”）
+prompt_input = st.chat_input(
+    "请输入您的问题..." if not st.session_state.is_running else "正在查询中，请稍候…",
+    disabled=bool(st.session_state.is_running),
+)
+
+# 第一步：用户提交后先缓存 prompt 并 rerun，使输入框立即进入“运行中”状态（更顺滑）
+if prompt_input:
+    st.session_state.pending_prompt = prompt_input
+    st.session_state.is_running = True
+    st.rerun()
+
+# 第二步：如果有待处理 prompt 且 is_running=True，就执行查询
+if st.session_state.pending_prompt and st.session_state.is_running:
+    prompt = st.session_state.pending_prompt
+
+    # 添加用户消息（只添加一次）
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    
-    # 显示加载状态
+
     with st.chat_message("assistant"):
-        # 默认折叠，但会显示“运行中”的状态块（用户可点开看过程）
         status_box = st.status("正在查询数据库…", expanded=False, state="running")
         live_handler = StreamlitStatusTraceHandler(status_box)
 
-        # 第1阶段：运行工具/SQL（不流式）
         tool_result = agent.run_tools(prompt, callbacks=[live_handler])
 
-        # 查询结束：更新状态（仍然保持折叠，避免占页面）
         if tool_result.get("success"):
             status_box.update(label="数据库查询完成", state="complete", expanded=False)
         else:
             status_box.update(label="数据库查询失败", state="error", expanded=False)
 
+        df = None
+        full_count = None
+
         if tool_result.get("success"):
-            # 如果有生成的SQL，先在可折叠框中展示（在最终回答之前）
             if tool_result.get("sql"):
                 with st.expander("📝 查看生成的 SQL 语句", expanded=False):
                     st.code(tool_result["sql"], language="sql")
 
-            # SQL 下方展示数据（前10行）+ 全量下载 + ECharts
             last_sql = tool_result.get("last_sql", "") or ""
             if last_sql:
                 try:
-                    engine = get_sqlalchemy_engine(st.session_state.db_name)
-                    df = execute_sql_to_df(last_sql, engine)
+                    eff = int(tool_result.get("effective_limit") or 20)
+                    eff = max(1, min(eff, MAX_HARD_LIMIT))
+                    limited_sql = sanitize_sql_query(last_sql, default_limit=eff, hard_limit=MAX_HARD_LIMIT)
 
-                    effective_limit = int(tool_result.get("effective_limit") or 20)
-                    PREVIEW_ROWS = min(effective_limit, 20)
+                    engine = get_sqlalchemy_engine(st.session_state.db_name)
+                    df = execute_sql_to_df(limited_sql, engine)
+
+                    # 计算“全量行数”：对去掉 LIMIT 的 SQL 做 COUNT(*)（失败则回退为 len(df)）
+                    try:
+                        sql_no_limit = strip_trailing_limit(last_sql)
+                        count_sql = f"SELECT COUNT(*) FROM ({sql_no_limit}) AS t"
+                        full_count = int(execute_scalar(count_sql, engine))
+                    except Exception:
+                        full_count = int(len(df)) if isinstance(df, pd.DataFrame) else None
+
+                    PREVIEW_ROWS = min(eff, 20)
                     preview_df = df.head(PREVIEW_ROWS)
-                    if len(df) <= PREVIEW_ROWS:
-                        st.markdown(f"**📄 查询结果（共 {len(df)} 行，已全部展示）**")
+                    if full_count is not None and full_count <= PREVIEW_ROWS:
+                        st.markdown(f"**📄 查询结果（共 {full_count} 行，已全部展示）**")
+                    elif full_count is not None:
+                        st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {full_count} 行）**")
                     else:
-                        st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {len(df)} 行）**")
-                    # Streamlit 新版推荐用 width="stretch"
+                        st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行）**")
                     st.dataframe(preview_df, width="stretch")
 
-                    # 全量下载（Excel）
+                    # 全量下载（注意：当前规则下数据库返回也最多 20 行；若你要“下载全量”，需要放开下载查询的 LIMIT）
                     excel_bytes = build_excel_bytes(df)
                     filename = f"query_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                     st.download_button(
@@ -407,16 +533,24 @@ if prompt := st.chat_input("请输入您的问题..."):
                         data=excel_bytes,
                         file_name=filename,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download-live-{stable_key_for_sql(st.session_state.db_name, limited_sql)}",
                     )
 
-                    # ECharts 可视化
                     if HAS_ECHARTS:
-                        option = auto_echarts_option(df)
-                        if option:
-                            st.markdown("**📊 可视化（ECharts）**")
-                            st_echarts(option, height="420px")
-                        else:
-                            st.caption("📊 当前结果不适合自动绘图（列类型不足或数据为空）。")
+                        try:
+                            df_info = build_df_info_for_viz(df, max_rows=20)
+                            viz = agent.generate_echarts_option(
+                                question=prompt,
+                                sql=tool_result.get("sql", ""),
+                                df_info=df_info,
+                            )
+                            if viz.get("show") and isinstance(viz.get("option"), dict):
+                                st.markdown("**📊 可视化（ECharts）**")
+                                st_echarts(viz["option"], height="420px", key=f"chart-live-{stable_key_for_sql(st.session_state.db_name, limited_sql)}")
+                            else:
+                                st.caption(f"📊 不展示图表：{viz.get('reason', '数据不适合')}")
+                        except Exception as e:
+                            st.caption(f"📊 图表生成失败：{e}")
                     else:
                         st.caption("📊 未安装 `streamlit-echarts`，暂不展示图表。")
                 except Exception as e:
@@ -424,34 +558,33 @@ if prompt := st.chat_input("请输入您的问题..."):
             else:
                 st.caption("⚠️ 未捕获到可用于展示的数据查询 SQL（last_sql 为空）。")
 
-            # 不再调用大模型生成“最终总结回复”，改为固定模板（零额外 token）
-            total_rows = int(df.shape[0]) if "df" in locals() and isinstance(df, pd.DataFrame) else None
-            if total_rows is not None:
-                final_answer = f"查询完成，共 {total_rows} 行结果。明细请查看上方表格，或点击下方按钮下载全量 Excel。"
+            # “查询完成”显示全量行数（full_count）
+            if full_count is not None:
+                final_answer = f"查询完成，共 {full_count} 行结果。明细请查看上方表格，或点击下方按钮下载 Excel。"
+            elif isinstance(df, pd.DataFrame):
+                final_answer = f"查询完成，共 {len(df)} 行结果。明细请查看上方表格，或点击下方按钮下载 Excel。"
             else:
-                final_answer = "查询完成。明细请查看上方表格，或点击下方按钮下载全量 Excel。"
+                final_answer = "查询完成。明细请查看上方表格，或点击下方按钮下载 Excel。"
             st.markdown(final_answer)
 
-            # 保存到消息历史（用于刷新后仍可见）
-            message_data = {
-                "role": "assistant",
-                "content": final_answer
-            }
-            # 如果有SQL，也保存到消息历史中
+            # 保存到消息历史：保存 last_sql + effective_limit + full_count，保证后续 rerun 不重复/不丢内容
+            msg = {"role": "assistant", "content": final_answer}
             if tool_result.get("sql"):
-                message_data["sql"] = tool_result["sql"]
-            # 保存 last_sql，用于 rerun 后重绘表格/下载/图表
+                msg["sql"] = tool_result["sql"]
             if tool_result.get("last_sql"):
-                message_data["last_sql"] = tool_result["last_sql"]
-            message_data["effective_limit"] = int(tool_result.get("effective_limit") or 20)
-            
-            st.session_state.messages.append(message_data)
+                msg["last_sql"] = tool_result["last_sql"]
+            msg["effective_limit"] = int(tool_result.get("effective_limit") or 20)
+            if full_count is not None:
+                msg["full_count"] = int(full_count)
+            st.session_state.messages.append(msg)
         else:
             error_msg = f"❌ 查询失败: {tool_result.get('error', '未知错误')}"
             st.error(error_msg)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": error_msg
-            })
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+    # 清理运行标记并 rerun，恢复输入框
+    st.session_state.pending_prompt = None
+    st.session_state.is_running = False
+    st.rerun()
 
 # （已移除）示例问题、系统信息：保持聊天界面简洁

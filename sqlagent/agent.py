@@ -454,6 +454,87 @@ class SQLAgent:
         msg = final_llm.invoke([system, human])
         # Chat message -> content
         return getattr(msg, "content", str(msg))
+
+    @staticmethod
+    def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+        """从模型输出中尽量提取 JSON 对象。"""
+        if not text:
+            return None
+        t = text.strip()
+        # 去掉代码围栏
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = re.sub(r"\s*```$", "", t).strip()
+        # 尝试直接解析
+        try:
+            obj = json.loads(t)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # 尝试提取第一个 {...}
+        m = re.search(r"\{[\s\S]*\}", t)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                return None
+        return None
+
+    def generate_echarts_option(
+        self,
+        *,
+        question: str,
+        sql: str,
+        df_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        让 LLM 根据 SQL 结果的摘要信息生成 ECharts option。
+        返回格式（JSON dict）：
+        - show: bool
+        - reason: str（可选）
+        - option: dict（show=true 时必需）
+        """
+        viz_llm = ChatTongyi(
+            model_name=Config.MODEL_NAME,
+            temperature=0,
+            streaming=False,
+        )
+
+        system = SystemMessage(
+            content=(
+                "你是数据可视化助手。你要根据给定的 SQL 结果摘要，自动选择合适的 ECharts 图表并输出 ECharts option。\n"
+                "必须严格输出一个 JSON 对象（不要 Markdown，不要解释性文字）。\n"
+                "如果数据不适合绘图（例如：全是ID/编码/高基数字符串、或无数值/无可聚合分类、或结果为空），请输出：\n"
+                "{\"show\": false, \"reason\": \"原因\"}\n"
+                "如果适合绘图，请输出：\n"
+                "{\"show\": true, \"option\": { ...ECharts option... }}\n"
+                "要求：option 尽量简洁；若类别过多只取 Top 20；轴标题使用中文；tooltip 开启。\n"
+                "禁止使用 dataset/transform 等高级特性（保证兼容性）；直接在 series.data 里给数组。\n"
+            )
+        )
+
+        human = HumanMessage(
+            content=(
+                f"用户问题：{question}\n"
+                f"SQL：{sql}\n"
+                f"结果摘要(JSON)：{json.dumps(df_info, ensure_ascii=False)}\n"
+            )
+        )
+
+        msg = viz_llm.invoke([system, human])
+        text = getattr(msg, "content", str(msg))
+        obj = self._extract_json(text)
+        if not obj:
+            return {"show": False, "reason": "模型未返回可解析的 JSON"}
+
+        # 规范化
+        show = bool(obj.get("show", False))
+        if show and not isinstance(obj.get("option"), dict):
+            return {"show": False, "reason": "模型返回 show=true 但缺少 option"}
+        return obj
     
     def get_schema_info(self) -> Dict[str, Any]:
         """
