@@ -5,6 +5,7 @@
 import streamlit as st
 import sys
 import os
+import json
 from io import BytesIO
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -30,7 +31,7 @@ except Exception:
 
 
 class StreamlitStatusTraceHandler(BaseCallbackHandler):
-    """把工具调用过程实时写到 Streamlit 的 st.status（默认折叠 + 运行状态）。"""
+    """把工具调用过程实时写到 Streamlit 的 st.status，展示完整执行流程。"""
 
     def __init__(self, status_box):
         self.status_box = status_box
@@ -58,6 +59,8 @@ class StreamlitStatusTraceHandler(BaseCallbackHandler):
 
         self.step_no += 1
         self._current_tool = tool_name
+        
+        # 显示工具调用信息
         self.status_box.write(f"**{self.step_no}. 调用工具：`{tool_name}`**")
         if normalized_input:
             if tool_name == "sql_db_query":
@@ -144,6 +147,15 @@ def get_df_for_sql(db_name: str, sql: str) -> pd.DataFrame:
 def stable_key_for_sql(db_name: str, sql: str) -> str:
     raw = (db_name + "\n" + (sql or "")).encode("utf-8", errors="ignore")
     return hashlib.md5(raw).hexdigest()
+
+
+# 缓存图表配置，避免历史消息重复调用 LLM
+@st.cache_data(ttl=600, show_spinner=False)
+def get_cached_echarts_option(cache_key: str, question: str, sql: str, df_info_json: str, _agent) -> Dict[str, Any]:
+    """缓存 ECharts 配置生成结果，避免历史消息每次 rerun 都重新调用 LLM。"""
+    import json
+    df_info = json.loads(df_info_json) if df_info_json else {}
+    return _agent.generate_echarts_option(question=question, sql=sql, df_info=df_info)
 
 def build_df_info_for_viz(df: pd.DataFrame, max_rows: int = 20) -> Dict[str, Any]:
     """给 LLM 用的可视化上下文：避免塞全量，提供列类型/基数/样例/简单统计。"""
@@ -318,6 +330,50 @@ st.set_page_config(
     layout="wide"
 )
 
+# 自定义样式：减少闪烁，增强视觉反馈
+st.markdown("""
+<style>
+    /* 进度提示动画 */
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+    }
+    .stStatus { transition: all 0.3s ease; }
+    
+    /* 数据表格过渡 */
+    .stDataFrame { 
+        animation: fadeIn 0.3s ease-in-out;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* 图表容器 */
+    iframe[title*="streamlit_echarts"] {
+        animation: slideUp 0.4s ease-out;
+    }
+    @keyframes slideUp {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* 聊天消息优化 */
+    .stChatMessage {
+        transition: all 0.2s ease;
+    }
+    
+    /* 下载按钮悬停效果 */
+    .stDownloadButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+    .stDownloadButton > button {
+        transition: all 0.2s ease;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # 使用 @st.cache_resource 缓存 Agent 对象（跨会话共享，刷新页面不重新初始化）
 @st.cache_resource
 def get_sql_agent(db_name: str = None):
@@ -343,7 +399,7 @@ if "is_running" not in st.session_state:
 
 # 获取缓存的 Agent（首次加载会显示加载提示）
 try:
-    with st.spinner("🔄 正在连接云端数据库并初始化Agent..."):
+    with st.spinner("正在连接云端数据库并初始化Agent..."):
         agent = get_sql_agent(st.session_state.db_name)
 except Exception as e:
     st.error(f"初始化 Agent 失败: {e}")
@@ -397,15 +453,15 @@ with st.sidebar:
 st.title("🤖 SQL Agent - 智能 MySQL 查询助手")
 st.caption(f"当前数据库: **{st.session_state.db_name}**")
 
-# 显示对话历史
-for message in st.session_state.messages:
+# 显示对话历史（使用缓存的数据，避免重复渲染）
+for msg_idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         # 如果是助手消息且有SQL，先显示SQL
         if message["role"] == "assistant" and "sql" in message:
             with st.expander("📝 查看生成的 SQL 语句", expanded=False):
                 st.code(message["sql"], language="sql")
 
-        # 如果历史消息里有 last_sql，则重绘“表格 + 下载 + 图表”
+        # 如果历史消息里有 last_sql，则重绘"表格 + 下载 + 图表"
         if message["role"] == "assistant" and message.get("last_sql"):
             try:
                 # 历史重绘也走统一 LIMIT 规则（≤20）
@@ -416,11 +472,18 @@ for message in st.session_state.messages:
                 effective_limit = int(message.get("effective_limit") or 20)
                 PREVIEW_ROWS = min(effective_limit, 20)
                 preview_df = df_hist.head(PREVIEW_ROWS)
-                if len(df_hist) <= PREVIEW_ROWS:
+                
+                # 显示全量行数（优先使用缓存的 full_count）
+                full_count = message.get("full_count")
+                if full_count is not None and full_count <= PREVIEW_ROWS:
+                    st.markdown(f"**📄 查询结果（共 {full_count} 行，已全部展示）**")
+                elif full_count is not None:
+                    st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {full_count} 行）**")
+                elif len(df_hist) <= PREVIEW_ROWS:
                     st.markdown(f"**📄 查询结果（共 {len(df_hist)} 行，已全部展示）**")
                 else:
                     st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {len(df_hist)} 行）**")
-                st.dataframe(preview_df, width="stretch")
+                st.dataframe(preview_df, use_container_width=True)
 
                 # 全量下载（Excel）— 需要唯一 key，避免 rerun 后组件状态错乱
                 excel_bytes = build_excel_bytes(df_hist)
@@ -434,27 +497,42 @@ for message in st.session_state.messages:
                     key=dl_key,
                 )
 
+                # 图表渲染：优先使用已缓存的 echarts_option，避免重复调用 LLM
                 if HAS_ECHARTS:
-                    # LLM 生成 option（若失败/不适合会返回 show=false）
-                    try:
-                        df_info = build_df_info_for_viz(df_hist, max_rows=20)
-                        viz = agent.generate_echarts_option(
-                            question="(历史消息重绘)",
-                            sql=message.get("last_sql", ""),
-                            df_info=df_info,
-                        )
-                        if viz.get("show") and isinstance(viz.get("option"), dict):
+                    cached_viz = message.get("echarts_viz")
+                    if cached_viz is not None:
+                        # 直接使用已存储的配置
+                        if cached_viz.get("show") and isinstance(cached_viz.get("option"), dict):
                             st.markdown("**📊 可视化（ECharts）**")
-                            st_echarts(viz["option"], height="420px", key=f"chart-{dl_key}")
-                        else:
-                            st.caption(f"📊 不展示图表：{viz.get('reason', '数据不适合')}")
-                    except Exception as e:
-                        st.caption(f"📊 图表生成失败：{e}")
+                            st_echarts(cached_viz["option"], height="420px", key=f"chart-{dl_key}")
+                        elif cached_viz.get("reason"):
+                            st.caption(f"📊 不展示图表：{cached_viz.get('reason', '数据不适合')}")
+                    else:
+                        # 兜底：使用缓存函数（仍然可能调用 LLM，但有 TTL 缓存）
+                        try:
+                            df_info = build_df_info_for_viz(df_hist, max_rows=20)
+                            cache_key = f"hist-{dl_key}"
+                            viz = get_cached_echarts_option(
+                                cache_key=cache_key,
+                                question="(历史消息重绘)",
+                                sql=message.get("last_sql", ""),
+                                df_info_json=json.dumps(df_info, ensure_ascii=False, default=str),
+                                _agent=agent,
+                            )
+                            if viz.get("show") and isinstance(viz.get("option"), dict):
+                                st.markdown("**📊 可视化（ECharts）**")
+                                st_echarts(viz["option"], height="420px", key=f"chart-{dl_key}")
+                            else:
+                                st.caption(f"📊 不展示图表：{viz.get('reason', '数据不适合')}")
+                        except Exception as e:
+                            st.caption(f"📊 图表生成失败：{e}")
             except Exception as e:
                 st.caption(f"⚠️ 查询结果展示失败：{e}")
         
-        # 显示消息内容
-        st.markdown(message["content"])
+        # 显示消息内容（允许助手消息 content 为空：只展示表格/下载等组件，不额外输出"查询完成…"文案）
+        content = message.get("content", "")
+        if isinstance(content, str) and content.strip():
+            st.markdown(content)
 
 # 输入框
 # 输入框（运行中禁用，并提示“正在运行”）
@@ -479,18 +557,20 @@ if st.session_state.pending_prompt and st.session_state.is_running:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        status_box = st.status("正在查询数据库…", expanded=False, state="running")
+        # 工具调用流程展示（默认折叠，用户点击可展开查看详情）
+        status_box = st.status("正在执行查询...", expanded=False, state="running")
         live_handler = StreamlitStatusTraceHandler(status_box)
 
         tool_result = agent.run_tools(prompt, callbacks=[live_handler])
 
         if tool_result.get("success"):
-            status_box.update(label="数据库查询完成", state="complete", expanded=False)
+            status_box.update(label="查询执行成功（点击展开详情）", state="complete", expanded=False)
         else:
-            status_box.update(label="数据库查询失败", state="error", expanded=False)
+            status_box.update(label="查询执行失败（点击查看详情）", state="error", expanded=False)
 
         df = None
         full_count = None
+        echarts_viz = None  # 用于缓存到消息
 
         if tool_result.get("success"):
             if tool_result.get("sql"):
@@ -507,7 +587,7 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                     engine = get_sqlalchemy_engine(st.session_state.db_name)
                     df = execute_sql_to_df(limited_sql, engine)
 
-                    # 计算“全量行数”：对去掉 LIMIT 的 SQL 做 COUNT(*)（失败则回退为 len(df)）
+                    # 计算"全量行数"：对去掉 LIMIT 的 SQL 做 COUNT(*)（失败则回退为 len(df)）
                     try:
                         sql_no_limit = strip_trailing_limit(last_sql)
                         count_sql = f"SELECT COUNT(*) FROM ({sql_no_limit}) AS t"
@@ -523,9 +603,9 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                         st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {full_count} 行）**")
                     else:
                         st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行）**")
-                    st.dataframe(preview_df, width="stretch")
+                    st.dataframe(preview_df, use_container_width=True)
 
-                    # 全量下载（注意：当前规则下数据库返回也最多 20 行；若你要“下载全量”，需要放开下载查询的 LIMIT）
+                    # 全量下载
                     excel_bytes = build_excel_bytes(df)
                     filename = f"query_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                     st.download_button(
@@ -536,7 +616,11 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                         key=f"download-live-{stable_key_for_sql(st.session_state.db_name, limited_sql)}",
                     )
 
+                    # 可视化生成
                     if HAS_ECHARTS:
+                        chart_placeholder = st.empty()
+                        chart_placeholder.info("正在生成可视化图表...")
+                        
                         try:
                             df_info = build_df_info_for_viz(df, max_rows=20)
                             viz = agent.generate_echarts_option(
@@ -544,13 +628,18 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                                 sql=tool_result.get("sql", ""),
                                 df_info=df_info,
                             )
+                            echarts_viz = viz  # 缓存到消息
+                            
+                            chart_placeholder.empty()  # 清除 loading 提示
                             if viz.get("show") and isinstance(viz.get("option"), dict):
                                 st.markdown("**📊 可视化（ECharts）**")
                                 st_echarts(viz["option"], height="420px", key=f"chart-live-{stable_key_for_sql(st.session_state.db_name, limited_sql)}")
                             else:
                                 st.caption(f"📊 不展示图表：{viz.get('reason', '数据不适合')}")
                         except Exception as e:
+                            chart_placeholder.empty()
                             st.caption(f"📊 图表生成失败：{e}")
+                            echarts_viz = {"show": False, "reason": str(e)}
                     else:
                         st.caption("📊 未安装 `streamlit-echarts`，暂不展示图表。")
                 except Exception as e:
@@ -558,17 +647,8 @@ if st.session_state.pending_prompt and st.session_state.is_running:
             else:
                 st.caption("⚠️ 未捕获到可用于展示的数据查询 SQL（last_sql 为空）。")
 
-            # “查询完成”显示全量行数（full_count）
-            if full_count is not None:
-                final_answer = f"查询完成，共 {full_count} 行结果。明细请查看上方表格，或点击下方按钮下载 Excel。"
-            elif isinstance(df, pd.DataFrame):
-                final_answer = f"查询完成，共 {len(df)} 行结果。明细请查看上方表格，或点击下方按钮下载 Excel。"
-            else:
-                final_answer = "查询完成。明细请查看上方表格，或点击下方按钮下载 Excel。"
-            st.markdown(final_answer)
-
-            # 保存到消息历史：保存 last_sql + effective_limit + full_count，保证后续 rerun 不重复/不丢内容
-            msg = {"role": "assistant", "content": final_answer}
+            # 保存到消息历史：保存 last_sql + effective_limit + full_count + echarts_viz
+            msg = {"role": "assistant", "content": ""}
             if tool_result.get("sql"):
                 msg["sql"] = tool_result["sql"]
             if tool_result.get("last_sql"):
@@ -576,6 +656,8 @@ if st.session_state.pending_prompt and st.session_state.is_running:
             msg["effective_limit"] = int(tool_result.get("effective_limit") or 20)
             if full_count is not None:
                 msg["full_count"] = int(full_count)
+            if echarts_viz is not None:
+                msg["echarts_viz"] = echarts_viz  # 缓存图表配置，历史渲染时直接使用
             st.session_state.messages.append(msg)
         else:
             error_msg = f"❌ 查询失败: {tool_result.get('error', '未知错误')}"
