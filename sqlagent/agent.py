@@ -46,6 +46,7 @@ def extract_requested_limit(question: str, hard_cap: int = MAX_HARD_LIMIT) -> in
     """
     从用户问题中抽取希望返回的行数 N（若未指定则默认 hard_cap），并强制不超过 hard_cap。
     支持：前10/Top10/只要5条/限制20行/返回十条 等。
+    （备用的正则方案，当 LLM 方案不可用时使用）
     """
     q = (question or "").strip()
     if not q:
@@ -65,6 +66,47 @@ def extract_requested_limit(question: str, hard_cap: int = MAX_HARD_LIMIT) -> in
             return max(1, min(n2, hard_cap))
 
     return hard_cap
+
+
+# 用于标记"用户想要全部数据"的特殊值
+LIMIT_ALL = 999999
+
+
+def extract_limit_with_llm(question: str, llm) -> int:
+    """
+    使用 LLM 智能判断用户想要的数据行数。
+    
+    返回值：
+    - 具体数字：用户明确指定了数量（如"前10个"、"Top 5"）
+    - LIMIT_ALL (999999)：用户想要全部数据（如"所有"、"全部"、"列出xxx"）
+    - 20：默认值，用户没有明确意图
+    """
+    prompt = f"""分析用户的问题，判断用户想要返回多少条数据。
+
+用户问题："{question}"
+
+请判断：
+1. 如果用户明确指定了数量（如"前10个"、"Top 5"、"最多20条"、"返回100行"），返回该数字
+2. 如果用户想要全部/所有数据（如"列出所有"、"全部"、"所有"、"查询xxx"没有数量限制），返回 -1
+3. 如果用户没有明确意图，返回 20
+
+只返回一个数字，不要其他内容。"""
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        result = response.content.strip()
+        
+        # 解析返回值
+        num = int(result)
+        if num == -1:
+            return LIMIT_ALL  # 用户想要全部
+        elif num > 0:
+            return num
+        else:
+            return 20  # 默认值
+    except Exception:
+        # LLM 调用失败，回退到正则方案
+        return extract_requested_limit(question, hard_cap=LIMIT_ALL)
 
 
 class AgentTraceHandler(BaseCallbackHandler):
@@ -327,8 +369,8 @@ class SQLAgent:
         extra_callbacks = callbacks or []
         callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
 
-        # 每轮根据用户输入计算有效 LIMIT（≤20），用于强制钳制 sql_db_query 返回行数
-        self._effective_limit = extract_requested_limit(question, hard_cap=MAX_HARD_LIMIT)
+        # 使用 LLM 智能判断用户想要的数据行数
+        self._effective_limit = extract_limit_with_llm(question, self.llm)
         
         try:
             # 使用回调处理器来捕获工具调用过程与SQL
@@ -364,15 +406,15 @@ class SQLAgent:
 
     def run_tools(self, question: str, callbacks: Optional[List[BaseCallbackHandler]] = None) -> Dict[str, Any]:
         """
-        只运行“工具调用/SQL执行”阶段，返回 SQL、工具 trace、以及最后一次 SQL 查询结果（字符串）。
+        只运行"工具调用/SQL执行"阶段，返回 SQL、工具 trace、以及最后一次 SQL 查询结果（字符串）。
         用于：先拿到 SQL 再开始流式生成最终回答。
         """
         trace_handler = AgentTraceHandler()
         extra_callbacks = callbacks or []
         callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
 
-        # 每轮根据用户输入计算有效 LIMIT（≤20），用于强制钳制 sql_db_query 返回行数
-        self._effective_limit = extract_requested_limit(question, hard_cap=MAX_HARD_LIMIT)
+        # 使用 LLM 智能判断用户想要的数据行数
+        self._effective_limit = extract_limit_with_llm(question, self.llm)
 
         try:
             result = self.agent_executor.invoke(

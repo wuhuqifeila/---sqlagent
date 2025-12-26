@@ -20,6 +20,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlagent import SQLAgent, Config
+from sqlagent.agent import LIMIT_ALL
 from sqlagent.security import sanitize_sql_query, MAX_HARD_LIMIT
 
 # ECharts（可选依赖，未安装时自动降级不显示图表）
@@ -464,33 +465,46 @@ for msg_idx, message in enumerate(st.session_state.messages):
         # 如果历史消息里有 last_sql，则重绘"表格 + 下载 + 图表"
         if message["role"] == "assistant" and message.get("last_sql"):
             try:
-                # 历史重绘也走统一 LIMIT 规则（≤20）
+                # effective_limit 是用户意图的数量
+                # - 具体数字（如400）：用户说"前400个"
+                # - LIMIT_ALL (999999)：用户想要全部数据
                 eff = int(message.get("effective_limit") or 20)
-                eff = max(1, min(eff, MAX_HARD_LIMIT))
-                limited_sql = sanitize_sql_query(message["last_sql"], default_limit=eff, hard_limit=MAX_HARD_LIMIT)
-                df_hist = get_df_for_sql(st.session_state.db_name, limited_sql)
-                effective_limit = int(message.get("effective_limit") or 20)
-                PREVIEW_ROWS = min(effective_limit, 20)
-                preview_df = df_hist.head(PREVIEW_ROWS)
+                eff = max(1, eff)
                 
-                # 显示全量行数（优先使用缓存的 full_count）
+                # 获取缓存的 full_count
                 full_count = message.get("full_count")
-                if full_count is not None and full_count <= PREVIEW_ROWS:
+                
+                # 如果用户想要全部数据（eff >= LIMIT_ALL），下载数量使用 full_count
+                if eff >= LIMIT_ALL and full_count is not None:
+                    download_limit = full_count
+                else:
+                    download_limit = eff
+                
+                # 预览用 SQL（最多20行）
+                preview_limit = min(download_limit, 20)
+                preview_sql = sanitize_sql_query(message["last_sql"], default_limit=preview_limit, hard_limit=20)
+                df_preview = get_df_for_sql(st.session_state.db_name, preview_sql)
+                
+                # 显示全量行数
+                if full_count is not None and full_count <= preview_limit:
                     st.markdown(f"**📄 查询结果（共 {full_count} 行，已全部展示）**")
                 elif full_count is not None:
-                    st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {full_count} 行）**")
-                elif len(df_hist) <= PREVIEW_ROWS:
-                    st.markdown(f"**📄 查询结果（共 {len(df_hist)} 行，已全部展示）**")
+                    st.markdown(f"**📄 查询结果（前 {len(df_preview)} 行 / 共 {full_count} 行）**")
+                elif len(df_preview) <= preview_limit:
+                    st.markdown(f"**📄 查询结果（共 {len(df_preview)} 行，已全部展示）**")
                 else:
-                    st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {len(df_hist)} 行）**")
-                st.dataframe(preview_df, use_container_width=True)
+                    st.markdown(f"**📄 查询结果（前 {len(df_preview)} 行）**")
+                st.dataframe(df_preview, use_container_width=True)
 
-                # 全量下载（Excel）— 需要唯一 key，避免 rerun 后组件状态错乱
-                excel_bytes = build_excel_bytes(df_hist)
+                # 下载：使用用户意图的数量（或全量）
+                download_sql = sanitize_sql_query(message["last_sql"], default_limit=download_limit, hard_limit=download_limit)
+                df_download = get_df_for_sql(st.session_state.db_name, download_sql)
+                excel_bytes = build_excel_bytes(df_download)
                 filename = f"query_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 dl_key = f"download-{stable_key_for_sql(st.session_state.db_name, message['last_sql'])}"
+                download_rows = len(df_download)
                 st.download_button(
-                    label="⬇️ 下载全量结果（Excel）",
+                    label=f"⬇️ 下载结果（Excel，共 {download_rows} 行）",
                     data=excel_bytes,
                     file_name=filename,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -510,7 +524,7 @@ for msg_idx, message in enumerate(st.session_state.messages):
                     else:
                         # 兜底：使用缓存函数（仍然可能调用 LLM，但有 TTL 缓存）
                         try:
-                            df_info = build_df_info_for_viz(df_hist, max_rows=20)
+                            df_info = build_df_info_for_viz(df_preview, max_rows=20)
                             cache_key = f"hist-{dl_key}"
                             viz = get_cached_echarts_option(
                                 cache_key=cache_key,
@@ -580,49 +594,63 @@ if st.session_state.pending_prompt and st.session_state.is_running:
             last_sql = tool_result.get("last_sql", "") or ""
             if last_sql:
                 try:
+                    # effective_limit 是用户意图的数量
+                    # - 具体数字（如400）：用户说"前400个"
+                    # - LIMIT_ALL (999999)：用户想要全部数据（如"所有"、"列出xxx"）
                     eff = int(tool_result.get("effective_limit") or 20)
-                    eff = max(1, min(eff, MAX_HARD_LIMIT))
-                    limited_sql = sanitize_sql_query(last_sql, default_limit=eff, hard_limit=MAX_HARD_LIMIT)
-
+                    eff = max(1, eff)
+                    
                     engine = get_sqlalchemy_engine(st.session_state.db_name)
-                    df = execute_sql_to_df(limited_sql, engine)
-
-                    # 计算"全量行数"：对去掉 LIMIT 的 SQL 做 COUNT(*)（失败则回退为 len(df)）
+                    
+                    # 计算"全量行数"：对去掉 LIMIT 的 SQL 做 COUNT(*)
                     try:
                         sql_no_limit = strip_trailing_limit(last_sql)
                         count_sql = f"SELECT COUNT(*) FROM ({sql_no_limit}) AS t"
                         full_count = int(execute_scalar(count_sql, engine))
                     except Exception:
-                        full_count = int(len(df)) if isinstance(df, pd.DataFrame) else None
+                        full_count = None
+                    
+                    # 如果用户想要全部数据（eff >= LIMIT_ALL），下载数量使用 full_count
+                    if eff >= LIMIT_ALL and full_count is not None:
+                        download_limit = full_count
+                    else:
+                        download_limit = eff
+                    
+                    # 预览用 SQL（最多20行）
+                    preview_limit = min(download_limit, 20)
+                    preview_sql = sanitize_sql_query(last_sql, default_limit=preview_limit, hard_limit=20)
+                    df_preview = execute_sql_to_df(preview_sql, engine)
 
-                    PREVIEW_ROWS = min(eff, 20)
-                    preview_df = df.head(PREVIEW_ROWS)
-                    if full_count is not None and full_count <= PREVIEW_ROWS:
+                    # 显示预览表格
+                    if full_count is not None and full_count <= preview_limit:
                         st.markdown(f"**📄 查询结果（共 {full_count} 行，已全部展示）**")
                     elif full_count is not None:
-                        st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行 / 共 {full_count} 行）**")
+                        st.markdown(f"**📄 查询结果（前 {len(df_preview)} 行 / 共 {full_count} 行）**")
                     else:
-                        st.markdown(f"**📄 查询结果（前 {PREVIEW_ROWS} 行）**")
-                    st.dataframe(preview_df, use_container_width=True)
+                        st.markdown(f"**📄 查询结果（前 {len(df_preview)} 行）**")
+                    st.dataframe(df_preview, use_container_width=True)
 
-                    # 全量下载
-                    excel_bytes = build_excel_bytes(df)
+                    # 下载：使用用户意图的数量（或全量）
+                    download_sql = sanitize_sql_query(last_sql, default_limit=download_limit, hard_limit=download_limit)
+                    df_download = execute_sql_to_df(download_sql, engine)
+                    excel_bytes = build_excel_bytes(df_download)
                     filename = f"query_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    download_rows = len(df_download)
                     st.download_button(
-                        label="⬇️ 下载全量结果（Excel）",
+                        label=f"⬇️ 下载结果（Excel，共 {download_rows} 行）",
                         data=excel_bytes,
                         file_name=filename,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download-live-{stable_key_for_sql(st.session_state.db_name, limited_sql)}",
+                        key=f"download-live-{stable_key_for_sql(st.session_state.db_name, download_sql)}",
                     )
 
-                    # 可视化生成
+                    # 可视化生成（使用预览数据）
                     if HAS_ECHARTS:
                         chart_placeholder = st.empty()
                         chart_placeholder.info("正在生成可视化图表...")
                         
                         try:
-                            df_info = build_df_info_for_viz(df, max_rows=20)
+                            df_info = build_df_info_for_viz(df_preview, max_rows=20)
                             viz = agent.generate_echarts_option(
                                 question=prompt,
                                 sql=tool_result.get("sql", ""),
@@ -633,7 +661,7 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                             chart_placeholder.empty()  # 清除 loading 提示
                             if viz.get("show") and isinstance(viz.get("option"), dict):
                                 st.markdown("**📊 可视化（ECharts）**")
-                                st_echarts(viz["option"], height="420px", key=f"chart-live-{stable_key_for_sql(st.session_state.db_name, limited_sql)}")
+                                st_echarts(viz["option"], height="420px", key=f"chart-live-{stable_key_for_sql(st.session_state.db_name, preview_sql)}")
                             else:
                                 st.caption(f"📊 不展示图表：{viz.get('reason', '数据不适合')}")
                         except Exception as e:
