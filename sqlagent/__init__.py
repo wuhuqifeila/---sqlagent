@@ -8,12 +8,13 @@ from .agent import SQLAgent
 from .config import Config
 from .security import sanitize_sql_query, validate_sql_syntax
 from .human_in_loop import HumanInLoopAgent
+from .code_sandbox import CodeSandbox
 
 __all__ = [
     "SQLAgent",
     "Config",
     "sanitize_sql_query",
     "validate_sql_syntax",
-    "HumanInLoopAgent"
+    "HumanInLoopAgent",
+    "CodeSandbox"
 ]
-
