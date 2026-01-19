@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlagent import SQLAgent, Config
-from sqlagent.agent import LIMIT_ALL
+from sqlagent.agent import LIMIT_ALL, extract_limit_with_llm
 from sqlagent.security import sanitize_sql_query, MAX_HARD_LIMIT
 from sqlagent.code_sandbox import execute_analysis_code
 
@@ -143,6 +143,73 @@ def df_preview_text(df: pd.DataFrame, n: int = 20) -> str:
     except Exception:
         # 兜底：CSV
         return d.to_csv(index=False)
+
+def _chinese_num_to_int(s: str) -> Optional[int]:
+    """支持 1-99 的中文数字（含“十/二十/二十一”）。"""
+    s = s.strip()
+    if not s:
+        return None
+    mapping = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if s == "十":
+        return 10
+    if "十" in s:
+        left, _, right = s.partition("十")
+        tens = 1 if left == "" else mapping.get(left)
+        if tens is None:
+            return None
+        ones = 0 if right == "" else mapping.get(right)
+        if ones is None:
+            return None
+        return tens * 10 + ones
+    if len(s) == 1 and s in mapping:
+        return mapping[s]
+    return None
+
+
+def _parse_user_limit(question: str) -> Optional[int]:
+    """规则优先：返回用户明确要求的行数；无法识别则返回 None。"""
+    q = (question or "").strip()
+    if not q:
+        return None
+
+    # 阿拉伯数字
+    m = re.search(r"(?i)(?:top|前|最多|只要|限制|返回|显示|取)\s*(\d{1,4})\s*(?:条|行)?", q)
+    if m:
+        return max(1, int(m.group(1)))
+
+    # 中文数字
+    m2 = re.search(r"(?:top|前|最多|只要|限制|返回|显示|取)\s*([一二两三四五六七八九十]{1,3})\s*(?:条|行)?", q)
+    if m2:
+        n2 = _chinese_num_to_int(m2.group(1))
+        if n2 is not None:
+            return max(1, n2)
+
+    # 全量关键词（放在数字之后，避免“所有…前5”被误判为全量）
+    if re.search(r"(全部|所有|全量|列出所有|查询所有|全部数据|所有数据)", q):
+        return LIMIT_ALL
+
+    return None
+
+
+def resolve_download_limit(question: str, llm) -> Optional[int]:
+    """
+    规则优先 + LLM 兜底：
+    - 返回 LIMIT_ALL 表示用户要全量
+    - 返回 N 表示用户要 N 行
+    - 返回 None 表示无法判断（按原 SQL 执行）
+    """
+    rule_limit = _parse_user_limit(question)
+    if rule_limit is not None:
+        return rule_limit
+
+    try:
+        llm_limit = extract_limit_with_llm(question, llm)
+        if llm_limit:
+            return llm_limit
+    except Exception:
+        pass
+
+    return None
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_df_for_sql(db_name: str, sql: str) -> pd.DataFrame:
@@ -377,6 +444,78 @@ st.markdown("""
     .stDownloadButton > button {
         transition: all 0.2s ease;
     }
+    
+    /* 侧边栏历史对话按钮样式 */
+    
+    /* 关键技巧：利用 :has() 选择器，当水平块内包含 primary 按钮（选中状态）时，
+       给整个水平块（HorizontalBlock）添加背景色。
+    */
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(button[kind="primary"]) {
+        background-color: rgba(26, 115, 232, 0.15);
+        border-radius: 6px;
+        padding-left: 4px;
+        transition: all 0.2s ease-in-out; /* 丝滑过渡 */
+    }
+
+    /* 悬停未选中行时：整体背景变灰 */
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(button[kind="secondary"]):hover {
+        background-color: #f0f0f0;
+        border-radius: 6px;
+        padding-left: 4px;
+        transition: all 0.2s ease-in-out; /* 丝滑过渡 */
+    }
+    
+    /* 选中状态（primary 按钮）：背景透明，文字蓝色 */
+    [data-testid="stSidebar"] .stButton button[kind="primary"] {
+        background-color: transparent !important;
+        color: #1a73e8 !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    
+    [data-testid="stSidebar"] .stButton button[kind="primary"]:hover {
+        background-color: transparent !important;
+        color: #1a73e8 !important;
+    }
+    
+    /* 未选中状态（secondary 按钮） */
+    [data-testid="stSidebar"] .stButton button[kind="secondary"] {
+        background-color: transparent !important;
+        color: inherit !important;
+        border: none !important; /* 去掉边框 */
+        transition: color 0.15s ease;
+    }
+    
+    /* 未选中状态悬停按钮：不单独变色，由父容器变色 */
+    [data-testid="stSidebar"] .stButton button[kind="secondary"]:hover {
+        background-color: transparent !important;
+        color: inherit !important;
+        border-color: transparent !important;
+    }
+    
+    /* 三点菜单按钮 */
+    [data-testid="stSidebar"] .stPopover button {
+        padding: 4px 8px !important;
+        min-height: auto !important;
+        background: transparent !important;
+        border: none !important;
+        opacity: 0; /* 默认隐藏 */
+        transition: opacity 0.2s ease-in-out; /* 丝滑显隐 */
+    }
+    
+    /* 选中行时：显示三点菜单 */
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has(button[kind="primary"]) .stPopover button {
+        opacity: 1;
+    }
+    
+    /* 悬停行时（无论选中与否）：显示三点菜单 */
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:hover .stPopover button {
+        opacity: 1;
+    }
+    
+    [data-testid="stSidebar"] .stPopover button:hover {
+        background: rgba(0,0,0,0.05) !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -391,11 +530,35 @@ def get_sql_agent(db_name: str = None):
     return SQLAgent(db_name=db_name)
 
 # 初始化 session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
+if "conversations" not in st.session_state:
+    st.session_state.conversations = []
+if "current_conv_id" not in st.session_state:
+    st.session_state.current_conv_id = None
 if "db_name" not in st.session_state:
     st.session_state.db_name = Config.DB_NAME
+
+# 确保至少有一个对话
+if not st.session_state.conversations:
+    conv_id = f"conv-{int(time.time() * 1000)}"
+    now_ts = time.time()
+    st.session_state.conversations.append(
+        {"id": conv_id, "messages": [], "created_at": now_ts, "updated_at": now_ts}
+    )
+    st.session_state.current_conv_id = conv_id
+
+# 绑定当前对话的消息列表
+current_conv = next(
+    (c for c in st.session_state.conversations if c["id"] == st.session_state.current_conv_id),
+    None
+)
+if current_conv is None:
+    conv_id = f"conv-{int(time.time() * 1000)}"
+    now_ts = time.time()
+    current_conv = {"id": conv_id, "messages": [], "created_at": now_ts, "updated_at": now_ts}
+    st.session_state.conversations.append(current_conv)
+    st.session_state.current_conv_id = conv_id
+
+st.session_state.messages = current_conv["messages"]
 
 # 用于更顺滑的“运行中禁用输入框”体验（两段式 rerun）
 if "pending_prompt" not in st.session_state:
@@ -415,7 +578,7 @@ if "current_analysis_question" not in st.session_state:
 
 # 获取缓存的 Agent（首次加载会显示加载提示）
 try:
-    with st.spinner("正在连接云端数据库并初始化Agent..."):
+    with st.spinner("正在连接数据库..."):
         agent = get_sql_agent(st.session_state.db_name)
 except Exception as e:
     st.error(f"初始化 Agent 失败: {e}")
@@ -423,13 +586,109 @@ except Exception as e:
 
 # 侧边栏配置
 with st.sidebar:
-    st.title("⚙️ 配置")
+    # 新建对话（放在侧边栏顶部）
+    if st.button("🆕 新建对话", use_container_width=True, disabled=not st.session_state.messages):
+        conv_id = f"conv-{int(time.time() * 1000)}"
+        now_ts = time.time()
+        st.session_state.conversations.append(
+            {"id": conv_id, "messages": [], "created_at": now_ts, "updated_at": now_ts}
+        )
+        st.session_state.current_conv_id = conv_id
+        st.rerun()
+
+    # 历史对话（GPT 风格列表）
+    st.subheader("🕘 历史对话")
+
+    def _conv_label(conv: Dict[str, Any]) -> str:
+        for msg in conv.get("messages", []):
+            if msg.get("role") == "user" and msg.get("content"):
+                text = msg.get("content", "").strip()
+                if text:
+                    return text[:20] + ("..." if len(text) > 20 else "")
+        return "新对话"
+
+    sorted_convs = sorted(
+        st.session_state.conversations,
+        key=lambda c: c.get("updated_at", c.get("created_at", 0)),
+        reverse=True,
+    )
     
+    # 重命名状态
+    if "renaming_conv_id" not in st.session_state:
+        st.session_state.renaming_conv_id = None
+    
+    if sorted_convs:
+        for conv in sorted_convs:
+            conv_id = conv.get("id")
+            label = conv.get("title") or _conv_label(conv)
+            is_selected = conv_id == st.session_state.current_conv_id
+            
+            # 如果正在重命名这个对话
+            if st.session_state.renaming_conv_id == conv_id:
+                col_input, col_ok = st.columns([0.8, 0.2])
+                with col_input:
+                    new_title = st.text_input(
+                        "重命名",
+                        value=label,
+                        key=f"rename-input-{conv_id}",
+                        label_visibility="collapsed",
+                    )
+                with col_ok:
+                    if st.button("✓", key=f"rename-ok-{conv_id}"):
+                        conv["title"] = new_title
+                        st.session_state.renaming_conv_id = None
+                        st.rerun()
+            else:
+                # 正常显示：对话按钮 + 三点菜单
+                col_btn, col_menu = st.columns([0.85, 0.15])
+                with col_btn:
+                    if st.button(
+                        label,
+                        key=f"conv-{conv_id}",
+                        use_container_width=True,
+                        type="primary" if is_selected else "secondary",
+                    ):
+                        st.session_state.current_conv_id = conv_id
+                        st.rerun()
+                
+                # 悬停或选中时显示三点菜单（目前 Streamlit 只能实现选中时一直显示，或者一直显示）
+                # 为了实现"悬停显示"效果，我们需要接受三点菜单一直存在，但未选中时颜色淡化
+                with col_menu:
+                    # 使用 popover 并自定义 CSS 让其默认透明，悬停显色（较难完美实现）
+                    # 现在的妥协方案：一直显示三点菜单，但未选中时淡化
+                    with st.popover("⋮", use_container_width=True):
+                        if st.button("✏️ 重命名", key=f"rename-{conv_id}", use_container_width=True):
+                            st.session_state.renaming_conv_id = conv_id
+                            st.rerun()
+                        if st.button("🗑️ 删除", key=f"delete-{conv_id}", use_container_width=True):
+                            st.session_state.conversations = [
+                                c for c in st.session_state.conversations if c["id"] != conv_id
+                            ]
+                            # 如果删除的是当前对话，切换到最新的
+                            if st.session_state.current_conv_id == conv_id:
+                                remaining = st.session_state.conversations
+                                if remaining:
+                                    st.session_state.current_conv_id = remaining[-1]["id"]
+                                else:
+                                    # 没有对话了，创建一个新的
+                                    new_id = f"conv-{int(time.time() * 1000)}"
+                                    now_ts = time.time()
+                                    st.session_state.conversations.append(
+                                        {"id": new_id, "messages": [], "created_at": now_ts, "updated_at": now_ts}
+                                    )
+                                    st.session_state.current_conv_id = new_id
+                            st.rerun()
+    else:
+        st.caption("暂无历史对话")
+
+    st.divider()
+
     # 数据库选择（使用缓存避免重复查询）
+    st.title("⚙️ 配置")
     @st.cache_data(ttl=300)  # 缓存5分钟
     def get_databases():
         return Config.get_available_databases()
-    
+
     try:
         databases = get_databases()
         selected_db = st.selectbox(
@@ -437,7 +696,7 @@ with st.sidebar:
             databases,
             index=databases.index(st.session_state.db_name) if st.session_state.db_name in databases else 0
         )
-        
+
         if selected_db != st.session_state.db_name:
             with st.spinner(f"切换到数据库 {selected_db}..."):
                 # 清除缓存，重新获取新数据库的 Agent
@@ -446,24 +705,10 @@ with st.sidebar:
                 st.rerun()  # 重新运行以使用新的数据库
     except Exception as e:
         st.error(f"获取数据库列表失败: {e}")
-    
+
     st.divider()
-    
-    # 显示当前数据库信息
-    st.subheader("📊 数据库信息")
-    if st.button("查看 Schema"):
-        schema_info = agent.get_schema_info()
-        st.write(f"**数据库**: {schema_info['database']}")
-        st.write(f"**表列表**: {', '.join(schema_info['tables'])}")
-        with st.expander("详细结构"):
-            st.code(schema_info['table_info'], language="sql")
-    
-    st.divider()
-    
-    # 清空对话
-    if st.button("🗑️ 清空对话"):
-        st.session_state.messages = []
-        st.rerun()
+
+    # 已移除清空对话按钮，改为“新建对话”
 
 # 主界面
 st.title("🤖 SQL Agent - 智能 MySQL 查询助手")
@@ -472,32 +717,40 @@ st.caption(f"当前数据库: **{st.session_state.db_name}**")
 # 显示对话历史（使用缓存的数据，避免重复渲染）
 for msg_idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
-        # 如果是助手消息且有SQL，先显示SQL
-        if message["role"] == "assistant" and "sql" in message:
+        # 如果是助手消息且有工具调用轨迹，先显示轨迹
+        if message["role"] == "assistant" and message.get("trace"):
+            with st.expander("🔧 查看工具调用过程", expanded=False):
+                for step_idx, step in enumerate(message["trace"], 1):
+                    tool_name = step.get("tool", "")
+                    tool_input = step.get("input", "")
+                    tool_output = step.get("output", "")
+                    st.write(f"**{step_idx}. 调用工具：`{tool_name}`**")
+                    if tool_input:
+                        if tool_name == "sql_db_query":
+                            st.write("输入（SQL）：")
+                            st.code(tool_input, language="sql")
+                        else:
+                            st.write("输入：")
+                            st.code(tool_input)
+                    if tool_output:
+                        st.write("输出：")
+                        st.code(tool_output[:2000] + ("..." if len(tool_output) > 2000 else ""))
+        
+        # 如果是助手消息且有SQL，显示SQL（优先展示下载SQL）
+        if message["role"] == "assistant" and ("download_sql" in message or "sql" in message):
             with st.expander("📝 查看生成的 SQL 语句", expanded=False):
-                st.code(message["sql"], language="sql")
+                st.code(message.get("download_sql") or message.get("sql", ""), language="sql")
 
         # 如果历史消息里有 last_sql，则重绘"表格 + 下载 + 图表"
         if message["role"] == "assistant" and message.get("last_sql"):
             try:
-                # effective_limit 是用户意图的数量
-                # - 具体数字（如400）：用户说"前400个"
-                # - LIMIT_ALL (999999)：用户想要全部数据
-                eff = int(message.get("effective_limit") or 20)
-                eff = max(1, eff)
-                
                 # 获取缓存的 full_count
                 full_count = message.get("full_count")
-                
-                # 如果用户想要全部数据（eff >= LIMIT_ALL），下载数量使用 full_count
-                if eff >= LIMIT_ALL and full_count is not None:
-                    download_limit = full_count
-                else:
-                    download_limit = eff
-                
-                # 预览用 SQL（最多20行）
-                preview_limit = min(download_limit, 20)
-                preview_sql = sanitize_sql_query(message["last_sql"], default_limit=preview_limit, hard_limit=20)
+
+                # 预览用 SQL（固定最多50行）：先去掉原 LIMIT，再强制加 LIMIT 50
+                preview_limit = 50
+                sql_no_limit = strip_trailing_limit(message["last_sql"])
+                preview_sql = sanitize_sql_query(sql_no_limit, default_limit=preview_limit, hard_limit=preview_limit)
                 df_preview = get_df_for_sql(st.session_state.db_name, preview_sql)
                 
                 # 显示全量行数
@@ -511,12 +764,24 @@ for msg_idx, message in enumerate(st.session_state.messages):
                     st.markdown(f"**📄 查询结果（前 {len(df_preview)} 行）**")
                 st.dataframe(df_preview, use_container_width=True)
 
-                # 下载：使用用户意图的数量（或全量）
-                download_sql = sanitize_sql_query(message["last_sql"], default_limit=download_limit, hard_limit=download_limit)
+                # 下载：按用户意图决定行数（规则优先 + LLM 兜底）
+                question_text = message.get("question", "") or ""
+                intent_limit = resolve_download_limit(question_text, agent.llm)
+                if intent_limit is None:
+                    download_sql = message["last_sql"]
+                elif intent_limit >= LIMIT_ALL:
+                    download_sql = strip_trailing_limit(message["last_sql"])
+                else:
+                    download_sql = sanitize_sql_query(
+                        message["last_sql"], default_limit=intent_limit, hard_limit=intent_limit
+                    )
                 df_download = get_df_for_sql(st.session_state.db_name, download_sql)
                 excel_bytes = build_excel_bytes(df_download)
                 filename = f"query_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                dl_key = f"download-{stable_key_for_sql(st.session_state.db_name, message['last_sql'])}"
+                dl_key = (
+                    f"download-{stable_key_for_sql(st.session_state.db_name, message['last_sql'])}"
+                    f"-msg-{msg_idx}"
+                )
                 download_rows = len(df_download)
                 st.download_button(
                     label=f"⬇️ 下载结果（Excel，共 {download_rows} 行）",
@@ -752,6 +1017,7 @@ if st.session_state.pending_prompt and st.session_state.is_running:
 
     # 添加用户消息（只添加一次）
     st.session_state.messages.append({"role": "user", "content": prompt})
+    current_conv["updated_at"] = time.time()
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -773,18 +1039,16 @@ if st.session_state.pending_prompt and st.session_state.is_running:
 
         if tool_result.get("success"):
             if tool_result.get("sql"):
+                # 优先展示按用户意图生成的“下载 SQL”
+                display_sql = None
+                if "download_sql" in locals():
+                    display_sql = download_sql
                 with st.expander("📝 查看生成的 SQL 语句", expanded=False):
-                    st.code(tool_result["sql"], language="sql")
+                    st.code(display_sql or tool_result["sql"], language="sql")
 
             last_sql = tool_result.get("last_sql", "") or ""
             if last_sql:
                 try:
-                    # effective_limit 是用户意图的数量
-                    # - 具体数字（如400）：用户说"前400个"
-                    # - LIMIT_ALL (999999)：用户想要全部数据（如"所有"、"列出xxx"）
-                    eff = int(tool_result.get("effective_limit") or 20)
-                    eff = max(1, eff)
-                    
                     engine = get_sqlalchemy_engine(st.session_state.db_name)
                     
                     # 计算"全量行数"：对去掉 LIMIT 的 SQL 做 COUNT(*)
@@ -795,15 +1059,10 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                     except Exception:
                         full_count = None
                     
-                    # 如果用户想要全部数据（eff >= LIMIT_ALL），下载数量使用 full_count
-                    if eff >= LIMIT_ALL and full_count is not None:
-                        download_limit = full_count
-                    else:
-                        download_limit = eff
-                    
-                    # 预览用 SQL（最多20行）
-                    preview_limit = min(download_limit, 20)
-                    preview_sql = sanitize_sql_query(last_sql, default_limit=preview_limit, hard_limit=20)
+                    # 预览用 SQL（固定最多50行）：先去掉原 LIMIT，再强制加 LIMIT 50
+                    preview_limit = 50
+                    sql_no_limit_preview = strip_trailing_limit(last_sql)
+                    preview_sql = sanitize_sql_query(sql_no_limit_preview, default_limit=preview_limit, hard_limit=preview_limit)
                     df_preview = execute_sql_to_df(preview_sql, engine)
 
                     # 显示预览表格
@@ -815,8 +1074,16 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                         st.markdown(f"**📄 查询结果（前 {len(df_preview)} 行）**")
                     st.dataframe(df_preview, use_container_width=True)
 
-                    # 下载：使用用户意图的数量（或全量）
-                    download_sql = sanitize_sql_query(last_sql, default_limit=download_limit, hard_limit=download_limit)
+                    # 下载：按用户意图决定行数（规则优先 + LLM 兜底）
+                    intent_limit = resolve_download_limit(prompt, agent.llm)
+                    if intent_limit is None:
+                        download_sql = last_sql
+                    elif intent_limit >= LIMIT_ALL:
+                        download_sql = strip_trailing_limit(last_sql)
+                    else:
+                        download_sql = sanitize_sql_query(
+                            last_sql, default_limit=intent_limit, hard_limit=intent_limit
+                        )
                     df_download = execute_sql_to_df(download_sql, engine)
                     excel_bytes = build_excel_bytes(df_download)
                     filename = f"query_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1030,10 +1297,12 @@ if st.session_state.pending_prompt and st.session_state.is_running:
             else:
                 st.caption("⚠️ 未捕获到可用于展示的数据查询 SQL（last_sql 为空）。")
 
-            # 保存到消息历史：保存 last_sql + effective_limit + full_count + echarts_viz
-            msg = {"role": "assistant", "content": ""}
+            # 保存到消息历史：保存 last_sql + effective_limit + full_count + echarts_viz + trace
+            msg = {"role": "assistant", "content": "", "question": prompt}
             if tool_result.get("sql"):
                 msg["sql"] = tool_result["sql"]
+            if "download_sql" in locals():
+                msg["download_sql"] = download_sql
             if tool_result.get("last_sql"):
                 msg["last_sql"] = tool_result["last_sql"]
             msg["effective_limit"] = int(tool_result.get("effective_limit") or 20)
@@ -1041,11 +1310,15 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                 msg["full_count"] = int(full_count)
             if echarts_viz is not None:
                 msg["echarts_viz"] = echarts_viz  # 缓存图表配置，历史渲染时直接使用
+            if tool_result.get("trace"):
+                msg["trace"] = tool_result["trace"]  # 保存工具调用轨迹
             st.session_state.messages.append(msg)
+            current_conv["updated_at"] = time.time()
         else:
             error_msg = f"❌ 查询失败: {tool_result.get('error', '未知错误')}"
             st.error(error_msg)
             st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            current_conv["updated_at"] = time.time()
 
     # 清理运行标记并 rerun，恢复输入框
     st.session_state.pending_prompt = None
