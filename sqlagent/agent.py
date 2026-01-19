@@ -200,7 +200,7 @@ class SQLAgent:
     @staticmethod
     def _create_default_system_prompt(schema_info: str, default_limit: int) -> str:
         """
-        创建默认的 System Prompt
+        创建默认的 System Prompt（包含完整 Schema）
         
         Args:
             schema_info: 数据库 Schema 信息
@@ -217,11 +217,42 @@ class SQLAgent:
 【规则】
 - 你需要查询数据时，只能调用工具 `sql_db_query`，并且一次只提交 **一条 SELECT** 查询。
 - 只读：禁止 INSERT / UPDATE / DELETE / ALTER / DROP / CREATE / REPLACE / TRUNCATE 等写操作。
-- 除非用户明确要求更多，否则默认最多返回 {default_limit} 行。
 - 如果工具返回 Error，请修正 SQL 后再重试。
 - 最多尝试 10 次；若仍失败，向用户说明原因并给出建议。
 - 尽量写明列名，避免 SELECT *。
 - 最终回答必须使用中文。
+"""
+
+    @staticmethod
+    def _create_lazy_system_prompt(db_name: str, default_limit: int) -> str:
+        """
+        创建延迟加载版 System Prompt（不包含完整 Schema，LLM 按需查询）
+        
+        这个版本不预加载表结构，而是让 LLM 在需要时通过工具自行查询，
+        大幅加快 Agent 初始化速度。
+        
+        Args:
+            db_name: 数据库名称
+            default_limit: 默认查询限制行数
+        
+        Returns:
+            System Prompt 字符串
+        """
+        return f"""你是一名严谨的 MySQL 数据分析助手，当前连接的数据库是 `{db_name}`。
+
+【工具使用流程】
+1. 先用 `sql_db_list_tables` 查看有哪些表
+2. 用 `sql_db_schema` 查看需要用到的表的结构（只查相关的表，不要一次查所有）
+3. 根据表结构编写 SQL，用 `sql_db_query` 执行查询
+
+【规则】
+- 严禁臆造表名或字段名，必须先通过工具确认表结构
+- 你需要查询数据时，只能调用工具 `sql_db_query`，并且一次只提交 **一条 SELECT** 查询
+- 只读：禁止 INSERT / UPDATE / DELETE / ALTER / DROP / CREATE / REPLACE / TRUNCATE 等写操作
+- 如果工具返回 Error，请修正 SQL 后再重试
+- 最多尝试 10 次；若仍失败，向用户说明原因并给出建议
+- 尽量写明列名，避免 SELECT *
+- 最终回答必须使用中文
 """
     """SQL Agent 主类"""
     
@@ -234,7 +265,9 @@ class SQLAgent:
         verbose: Optional[bool] = None,
         agent_type: Optional[str] = None,
         default_limit: int = Config.DEFAULT_LIMIT,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        lazy_schema: bool = True,  # 新增：是否延迟加载 Schema（默认开启，加快初始化）
+        verify_only: bool = False,  # 新增：仅验证 SQL（EXPLAIN），不实际执行查询
     ):
         """
         初始化 SQL Agent
@@ -248,6 +281,8 @@ class SQLAgent:
             agent_type: Agent 类型
             default_limit: 默认查询限制行数
             system_prompt: 自定义系统提示词（如果为 None，则使用默认提示词）
+            lazy_schema: 是否延迟加载 Schema（True=快速初始化，LLM按需查询表结构；False=预加载全部表结构）
+            verify_only: 是否仅验证 SQL（True=只做 EXPLAIN，不执行实际查询）
         """
         # 设置环境变量
         os.environ["DASHSCOPE_API_KEY"] = Config.DASHSCOPE_API_KEY
@@ -270,9 +305,17 @@ class SQLAgent:
             }
         }
         
-        self.db = SQLDatabase.from_uri(db_uri, engine_args=engine_args)
+        # 优化：减少 sample_rows 和禁用视图支持，加快 SQLDatabase 初始化
+        self.db = SQLDatabase.from_uri(
+            db_uri, 
+            engine_args=engine_args,
+            sample_rows_in_table_info=0,  # 不获取样本行（加快初始化）
+            view_support=False,            # 不加载视图（加快初始化）
+        )
         self.db_name = target_db
         self.default_limit = default_limit
+        self._lazy_schema = lazy_schema
+        self._verify_only = verify_only
         # 当前问题的有效 LIMIT（每次 query/run_tools 时更新），用于强制钳制 sql_db_query 的返回行数
         self._effective_limit: int = min(int(default_limit), MAX_HARD_LIMIT)
 
@@ -285,11 +328,15 @@ class SQLAgent:
             temperature=temperature if temperature is not None else Config.TEMPERATURE
         )
         
-        # 创建自定义 System Prompt（参考文档）
+        # 创建 System Prompt
         if system_prompt is None:
-            # 使用默认 System Prompt
-            schema_info = self.db.get_table_info()
-            system_prompt = self._create_default_system_prompt(schema_info, self.default_limit)
+            if lazy_schema:
+                # 延迟加载模式：不预加载表结构，LLM 按需查询（快速初始化）
+                system_prompt = self._create_lazy_system_prompt(target_db, self.default_limit)
+            else:
+                # 预加载模式：获取完整表结构嵌入 Prompt（初始化较慢）
+                schema_info = self.db.get_table_info()
+                system_prompt = self._create_default_system_prompt(schema_info, self.default_limit)
         
         # 创建 SystemMessage
         system_message = SystemMessage(content=system_prompt)
@@ -329,6 +376,17 @@ class SQLAgent:
         def _wrap_run(fn):
             # fn 是“已绑定方法”（bound method），直接调用即可；不要再用 MethodType 二次绑定
             def _inner(command: str, *args, **kwargs):
+                if self._verify_only:
+                    # 仅验证 SQL：用 EXPLAIN，不执行实际查询；不强制添加 LIMIT
+                    raw = (command or "").strip()
+                    if not raw:
+                        return fn(raw, *args, **kwargs)
+                    if re.search(r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|REPLACE|TRUNCATE|GRANT|REVOKE)\b", raw, re.IGNORECASE):
+                        raise ValueError("检测到非查询语句，仅允许 SELECT 操作。")
+                    if not raw.upper().startswith("SELECT"):
+                        raise ValueError("仅允许 SELECT 查询语句")
+                    explain_sql = f"EXPLAIN {raw.rstrip(';')}"
+                    return fn(explain_sql, *args, **kwargs)
                 try:
                     # 只对 SELECT 做限流；sanitize_sql_query 内部也会拒绝非 SELECT
                     limited = sanitize_sql_query(command, default_limit=self._effective_limit)
@@ -369,8 +427,11 @@ class SQLAgent:
         extra_callbacks = callbacks or []
         callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
 
-        # 使用 LLM 智能判断用户想要的数据行数
-        self._effective_limit = extract_limit_with_llm(question, self.llm)
+        # 使用 LLM 智能判断用户想要的数据行数（仅在非 verify_only 模式）
+        if not self._verify_only:
+            self._effective_limit = extract_limit_with_llm(question, self.llm)
+        else:
+            self._effective_limit = min(int(self.default_limit), MAX_HARD_LIMIT)
         
         try:
             # 使用回调处理器来捕获工具调用过程与SQL
@@ -413,8 +474,11 @@ class SQLAgent:
         extra_callbacks = callbacks or []
         callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
 
-        # 使用 LLM 智能判断用户想要的数据行数
-        self._effective_limit = extract_limit_with_llm(question, self.llm)
+        # 使用 LLM 智能判断用户想要的数据行数（仅在非 verify_only 模式）
+        if not self._verify_only:
+            self._effective_limit = extract_limit_with_llm(question, self.llm)
+        else:
+            self._effective_limit = min(int(self.default_limit), MAX_HARD_LIMIT)
 
         try:
             result = self.agent_executor.invoke(
@@ -607,15 +671,31 @@ class SQLAgent:
             "default_limit": self.default_limit
         }
     
-    def switch_database(self, db_name: str):
-        """切换数据库"""
+    def switch_database(self, db_name: str, lazy_schema: Optional[bool] = None):
+        """
+        切换数据库
+        
+        Args:
+            db_name: 目标数据库名称
+            lazy_schema: 是否延迟加载（None 表示沿用初始化时的设置）
+        """
         db_uri = Config.get_db_uri(db_name)
-        self.db = SQLDatabase.from_uri(db_uri)
+        self.db = SQLDatabase.from_uri(
+            db_uri,
+            sample_rows_in_table_info=0,  # 不获取样本行（加快初始化）
+            view_support=False,            # 不加载视图（加快初始化）
+        )
         self.db_name = db_name
         
-        # 更新 system prompt 中的 schema 信息
-        schema_info = self.db.get_table_info()
-        self.system_prompt = self._create_default_system_prompt(schema_info, self.default_limit)
+        # 确定是否使用延迟加载
+        use_lazy = lazy_schema if lazy_schema is not None else self._lazy_schema
+        
+        # 更新 system prompt
+        if use_lazy:
+            self.system_prompt = self._create_lazy_system_prompt(db_name, self.default_limit)
+        else:
+            schema_info = self.db.get_table_info()
+            self.system_prompt = self._create_default_system_prompt(schema_info, self.default_limit)
         
         # 重新创建 Agent
         system_message = SystemMessage(content=self.system_prompt)

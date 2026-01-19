@@ -39,12 +39,21 @@ class Config:
     # Qwen API 配置
     DASHSCOPE_API_KEY: str = get_config_value("DASHSCOPE_API_KEY", "sk-fdefbafb8ecf480b8b0faeb3de8746fc")
     
-    # 数据库配置（云端MySQL）
-    DB_USER: str = get_config_value("DB_USER", "bobo11")
-    DB_PASSWORD: str = get_config_value("DB_PASSWORD", "ls0OmCgVJIXHwawv")
-    DB_HOST: str = get_config_value("DB_HOST", "mysql2.sqlpub.com")
-    DB_PORT: int = int(get_config_value("DB_PORT", "3307"))
-    DB_NAME: Optional[str] = get_config_value("DB_NAME", "wutongbei")  # 云端数据库名
+    # ========== 数据库配置 ==========
+    
+    # --- 本地 Docker MySQL (当前使用) ---
+    DB_USER: str = get_config_value("DB_USER", "root")
+    DB_PASSWORD: str = get_config_value("DB_PASSWORD", "123456")
+    DB_HOST: str = get_config_value("DB_HOST", "127.0.0.1")
+    DB_PORT: int = int(get_config_value("DB_PORT", "3306"))
+    DB_NAME: Optional[str] = get_config_value("DB_NAME", None)  # 本地数据库，启动时选择
+    
+    # --- 云端 MySQL (备用，取消注释切换) ---
+    # DB_USER: str = get_config_value("DB_USER", "bobo11")
+    # DB_PASSWORD: str = get_config_value("DB_PASSWORD", "ls0OmCgVJIXHwawv")
+    # DB_HOST: str = get_config_value("DB_HOST", "mysql2.sqlpub.com")
+    # DB_PORT: int = int(get_config_value("DB_PORT", "3307"))
+    # DB_NAME: Optional[str] = get_config_value("DB_NAME", "wutongbei")  # 云端数据库名
     
     # LLM 配置
     MODEL_NAME: str = get_config_value("MODEL_NAME", "qwen3-max")
@@ -52,7 +61,7 @@ class Config:
     STREAMING: bool = str(get_config_value("STREAMING", "False")).lower() == "true"
     
     # Agent 配置
-    MAX_ITERATIONS: int = int(get_config_value("MAX_ITERATIONS", "10"))
+    MAX_ITERATIONS: int = int(get_config_value("MAX_ITERATIONS", "20"))
     VERBOSE: bool = str(get_config_value("VERBOSE", "True")).lower() == "true"
     AGENT_TYPE: str = get_config_value("AGENT_TYPE", "openai-tools")
     
