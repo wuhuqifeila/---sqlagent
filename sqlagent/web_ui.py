@@ -15,6 +15,10 @@ import pandas as pd
 from sqlalchemy import create_engine
 import hashlib
 import re
+import asyncio
+
+# Add missing import for HumanMessage
+from langchain_core.messages import HumanMessage
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlagent import SQLAgent, Config
 from sqlagent.agent import LIMIT_ALL
 from sqlagent.security import sanitize_sql_query, MAX_HARD_LIMIT
+from sqlagent.code_sandbox import execute_analysis_code
 
 # ECharts（可选依赖，未安装时自动降级不显示图表）
 try:
@@ -398,6 +403,16 @@ if "pending_prompt" not in st.session_state:
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
 
+# 添加数据分析报告相关的session state
+if "analysis_reports" not in st.session_state:
+    st.session_state.analysis_reports = {}
+
+if "current_analysis_df" not in st.session_state:
+    st.session_state.current_analysis_df = None
+
+if "current_analysis_question" not in st.session_state:
+    st.session_state.current_analysis_question = ""
+
 # 获取缓存的 Agent（首次加载会显示加载提示）
 try:
     with st.spinner("正在连接云端数据库并初始化Agent..."):
@@ -510,6 +525,176 @@ for msg_idx, message in enumerate(st.session_state.messages):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=dl_key,
                 )
+
+                # 新增：自定义分析要求输入框
+                custom_analysis_req = st.text_input(
+                    "📊 自定义分析要求（可选）:",
+                    key=f"custom-analysis-req-{dl_key}",
+                    placeholder="例如：重点关注销售额趋势、按地区分组统计、生成相关性热力图等"
+                )
+
+                # 新增：生成数据分析报告按钮
+                report_key = f"report-{dl_key}"
+                if st.button("📊 生成数据分析报告", key=f"generate-report-{dl_key}"):
+                    try:
+                        with st.spinner("正在生成数据分析报告..."):
+                            # 保存当前分析所需的数据
+                            st.session_state.current_analysis_df = df_download.copy()
+                            st.session_state.current_analysis_question = message.get("question", "")
+                            
+                            # 生成Excel文件用于沙箱执行
+                            excel_filename = f"temp_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                            excel_path = f"/tmp/{excel_filename}"
+                            df_download.to_excel(excel_path, index=False)
+                            
+                            # 生成PDF报告文件路径
+                            report_filename = f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                            report_path = f"/tmp/{report_filename}"
+                            
+                            # 构建分析提示词
+                            base_prompt = f"""
+你是一名专业的数据科学家。请基于用户的问题和提供的DataFrame（变量名: df）生成完整的Python数据分析代码。
+
+用户问题: {st.session_state.current_analysis_question}
+"""
+                            
+                            if custom_analysis_req.strip():
+                                base_prompt += f"\n用户自定义分析要求: {custom_analysis_req.strip()}\n"
+                            
+                            analysis_prompt = base_prompt + f"""
+要求：
+1. 进行全面的数据分析，包括基本统计、相关性分析、分布分析等
+2. 生成高质量的可视化图表（使用matplotlib/seaborn），**所有图表标题、标签、图例必须使用英文**
+3. 将所有分析结果整合到一个PDF报告中，**包含详细的中文文字描述和解释**
+4. PDF报告必须保存到路径: {report_path}
+5. **中文文字描述内容应包括**：
+   - 数据概览（形状、列信息、数据类型）
+   - 缺失值分析
+   - 基本统计摘要
+   - 数值列的分布特征分析
+   - 分类列的频次分析  
+   - 相关性分析（如果适用）
+   - 关键发现和洞察总结
+6. 不要使用plt.show()，直接保存图表到PDF
+7. 确保代码完整可运行，包含所有必要的import语句
+8. **重要：处理中文标签时使用提供的转换函数**：
+   ```python
+   # 如果您的数据包含中文分类标签，使用以下函数转换为英文
+   # x_labels = safe_translate_labels(original_labels)
+   # ax.set_xticklabels(x_labels)
+   
+   # 或者在创建图表时直接转换
+   # categories = [translate_chinese_to_english(cat) for cat in original_categories]
+   ```
+9. **必须包含matplotlib英文配置**：
+   ```python
+   import matplotlib.pyplot as plt
+   import matplotlib
+   matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+   matplotlib.rcParams['axes.unicode_minus'] = False
+   ```
+10. **必须包含reportlab中文字体配置**：
+    ```python
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import os
+    
+    # 注册中文字体用于PDF文字描述
+    font_name = 'Helvetica'
+    try:
+        font_paths_to_try = [
+            '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+            '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+        ]
+        
+        for font_path in font_paths_to_try:
+            try:
+                if os.path.exists(font_path):
+                    if font_path.endswith('.ttc'):
+                        pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
+                    else:
+                        pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
+                    font_name = 'ChineseFont'
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass  # 使用默认字体
+    ```
+11. 在创建PDF样式时，使用 fontName=font_name 参数
+12. 确保所有图表在保存前调用 plt.savefig()，保存后调用 plt.close()
+
+**数据特点说明：**
+- 数据可能包含中文列名和文本数据
+- 包含日期时间列（register_date, create_time, update_time）
+- 数值列可能包括total_assets
+- 需要适当处理非数值列，避免在数值分析中出错
+
+**输出格式要求：**
+- PDF报告应该包含中文文字描述段落和对应的英文图表
+- 每个分析部分都应该有清晰的中文标题和详细的文字解释
+- 文字描述应该专业、准确、易于理解
+- **图表中的所有文字（包括坐标轴标签、图例、标题）必须是英文**
+
+请只返回Python代码，不要包含任何解释性文字。
+"""
+                            
+                            # 调用大模型生成分析代码
+                            analysis_code_response = agent.llm.invoke([HumanMessage(content=analysis_prompt)])
+                            analysis_code = analysis_code_response.content.strip()
+                            
+                            # 如果代码被包裹在代码块中，提取纯代码
+                            if analysis_code.startswith("```python"):
+                                analysis_code = analysis_code[9:-3] if analysis_code.endswith("```") else analysis_code[9:]
+                            elif analysis_code.startswith("```"):
+                                analysis_code = analysis_code[3:-3] if analysis_code.endswith("```") else analysis_code[3:]
+                            
+                            # 在沙箱中执行代码
+                            result = asyncio.run(
+                                execute_analysis_code(analysis_code, excel_path, report_path, timeout=120)
+                            )
+                            
+                            if result["success"] and os.path.exists(report_path):
+                                # 读取PDF文件
+                                with open(report_path, "rb") as f:
+                                    pdf_bytes = f.read()
+                                    
+                                # 保存到session state以便下载
+                                report_cache_key = stable_key_for_sql(st.session_state.db_name, message['last_sql'])
+                                st.session_state.analysis_reports[report_cache_key] = {
+                                    'pdf_bytes': pdf_bytes,
+                                    'filename': report_filename
+                                }
+                                
+                                st.success("✅ 数据分析报告生成成功！")
+                                st.download_button(
+                                    label="📥 下载数据分析报告 (PDF)",
+                                    data=pdf_bytes,
+                                    file_name=report_filename,
+                                    mime="application/pdf",
+                                    key=f"download-report-{dl_key}"
+                                )
+                            else:
+                                error_msg = result.get("error", "未知错误")
+                                st.error(f"❌ 报告生成失败: {error_msg}")
+                                # 显示生成的代码以便调试
+                                with st.expander("查看生成的代码（用于调试）"):
+                                    st.code(analysis_code, language="python")
+                    
+                    except Exception as e:
+                        st.error(f"❌ 报告生成出错: {str(e)}")
+                        import traceback
+                        st.text(traceback.format_exc())
+                    finally:
+                        # 清理临时文件
+                        try:
+                            if 'excel_path' in locals() and os.path.exists(excel_path):
+                                os.remove(excel_path)
+                            if 'report_path' in locals() and os.path.exists(report_path):
+                                os.remove(report_path)
+                        except Exception:
+                            pass
 
                 # 图表渲染：优先使用已缓存的 echarts_option，避免重复调用 LLM
                 if HAS_ECHARTS:
@@ -643,6 +828,176 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key=f"download-live-{stable_key_for_sql(st.session_state.db_name, download_sql)}",
                     )
+
+                    # 新增：自定义分析要求输入框（实时查询结果）
+                    custom_analysis_req_live = st.text_input(
+                        "📊 自定义分析要求（可选）:",
+                        key=f"custom-analysis-req-live-{stable_key_for_sql(st.session_state.db_name, download_sql)}",
+                        placeholder="例如：重点关注销售额趋势、按地区分组统计、生成相关性热力图等"
+                    )
+
+                    # 新增：生成数据分析报告按钮（实时查询结果）
+                    live_report_key = f"live-report-{stable_key_for_sql(st.session_state.db_name, download_sql)}"
+                    if st.button("📊 生成数据分析报告", key=f"generate-live-report-{stable_key_for_sql(st.session_state.db_name, download_sql)}"):
+                        try:
+                            with st.spinner("正在生成数据分析报告..."):
+                                # 保存当前分析所需的数据
+                                st.session_state.current_analysis_df = df_download.copy()
+                                st.session_state.current_analysis_question = prompt
+                                
+                                # 生成Excel文件用于沙箱执行
+                                excel_filename = f"temp_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                                excel_path = f"/tmp/{excel_filename}"
+                                df_download.to_excel(excel_path, index=False)
+                                
+                                # 生成PDF报告文件路径
+                                report_filename = f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                                report_path = f"/tmp/{report_filename}"
+                                
+                                # 构建分析提示词
+                                base_prompt = f"""
+你是一名专业的数据科学家。请基于用户的问题和提供的DataFrame（变量名: df）生成完整的Python数据分析代码。
+
+用户问题: {prompt}
+"""
+                                
+                                if custom_analysis_req_live.strip():
+                                    base_prompt += f"\n用户自定义分析要求: {custom_analysis_req_live.strip()}\n"
+                                
+                                analysis_prompt = base_prompt + f"""
+要求：
+1. 进行全面的数据分析，包括基本统计、相关性分析、分布分析等
+2. 生成高质量的可视化图表（使用matplotlib/seaborn），**所有图表标题、标签、图例必须使用英文**
+3. 将所有分析结果整合到一个PDF报告中，**包含详细的中文文字描述和解释**
+4. PDF报告必须保存到路径: {report_path}
+5. **中文文字描述内容应包括**：
+   - 数据概览（形状、列信息、数据类型）
+   - 缺失值分析
+   - 基本统计摘要
+   - 数值列的分布特征分析
+   - 分类列的频次分析  
+   - 相关性分析（如果适用）
+   - 关键发现和洞察总结
+6. 不要使用plt.show()，直接保存图表到PDF
+7. 确保代码完整可运行，包含所有必要的import语句
+8. **重要：处理中文标签时使用提供的转换函数**：
+   ```python
+   # 如果您的数据包含中文分类标签，使用以下函数转换为英文
+   # x_labels = safe_translate_labels(original_labels)
+   # ax.set_xticklabels(x_labels)
+   
+   # 或者在创建图表时直接转换
+   # categories = [translate_chinese_to_english(cat) for cat in original_categories]
+   ```
+9. **必须包含matplotlib英文配置**：
+   ```python
+   import matplotlib.pyplot as plt
+   import matplotlib
+   matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+   matplotlib.rcParams['axes.unicode_minus'] = False
+   ```
+10. **必须包含reportlab中文字体配置**：
+    ```python
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import os
+    
+    # 注册中文字体用于PDF文字描述
+    font_name = 'Helvetica'
+    try:
+        font_paths_to_try = [
+            '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+            '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+        ]
+        
+        for font_path in font_paths_to_try:
+            try:
+                if os.path.exists(font_path):
+                    if font_path.endswith('.ttc'):
+                        pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
+                    else:
+                        pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
+                    font_name = 'ChineseFont'
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass  # 使用默认字体
+    ```
+11. 在创建PDF样式时，使用 fontName=font_name 参数
+12. 确保所有图表在保存前调用 plt.savefig()，保存后调用 plt.close()
+
+**数据特点说明：**
+- 数据可能包含中文列名和文本数据
+- 包含日期时间列（register_date, create_time, update_time）
+- 数值列可能包括total_assets
+- 需要适当处理非数值列，避免在数值分析中出错
+
+**输出格式要求：**
+- PDF报告应该包含中文文字描述段落和对应的英文图表
+- 每个分析部分都应该有清晰的中文标题和详细的文字解释
+- 文字描述应该专业、准确、易于理解
+- **图表中的所有文字（包括坐标轴标签、图例、标题）必须是英文**
+
+请只返回Python代码，不要包含任何解释性文字。
+"""
+                                
+                                # 调用大模型生成分析代码
+                                analysis_code_response = agent.llm.invoke([HumanMessage(content=analysis_prompt)])
+                                analysis_code = analysis_code_response.content.strip()
+                                
+                                # 如果代码被包裹在代码块中，提取纯代码
+                                if analysis_code.startswith("```python"):
+                                    analysis_code = analysis_code[9:-3] if analysis_code.endswith("```") else analysis_code[9:]
+                                elif analysis_code.startswith("```"):
+                                    analysis_code = analysis_code[3:-3] if analysis_code.endswith("```") else analysis_code[3:]
+                                
+                                # 在沙箱中执行代码
+                                result = asyncio.run(
+                                    execute_analysis_code(analysis_code, excel_path, report_path, timeout=120)
+                                )
+                                
+                                if result["success"] and os.path.exists(report_path):
+                                    # 读取PDF文件
+                                    with open(report_path, "rb") as f:
+                                        pdf_bytes = f.read()
+                                        
+                                    # 保存到session state以便下载
+                                    report_cache_key = stable_key_for_sql(st.session_state.db_name, download_sql)
+                                    st.session_state.analysis_reports[report_cache_key] = {
+                                        'pdf_bytes': pdf_bytes,
+                                        'filename': report_filename
+                                    }
+                                    
+                                    st.success("✅ 数据分析报告生成成功！")
+                                    st.download_button(
+                                        label="📥 下载数据分析报告 (PDF)",
+                                        data=pdf_bytes,
+                                        file_name=report_filename,
+                                        mime="application/pdf",
+                                        key=f"download-live-report-{stable_key_for_sql(st.session_state.db_name, download_sql)}"
+                                    )
+                                else:
+                                    error_msg = result.get("error", "未知错误")
+                                    st.error(f"❌ 报告生成失败: {error_msg}")
+                                    # 显示生成的代码以便调试
+                                    with st.expander("查看生成的代码（用于调试）"):
+                                        st.code(analysis_code, language="python")
+                        
+                        except Exception as e:
+                            st.error(f"❌ 报告生成出错: {str(e)}")
+                            import traceback
+                            st.text(traceback.format_exc())
+                        finally:
+                            # 清理临时文件
+                            try:
+                                if 'excel_path' in locals() and os.path.exists(excel_path):
+                                    os.remove(excel_path)
+                                if 'report_path' in locals() and os.path.exists(report_path):
+                                    os.remove(report_path)
+                            except Exception:
+                                pass
 
                     # 可视化生成（使用预览数据）
                     if HAS_ECHARTS:
