@@ -41,19 +41,19 @@ class Config:
     
     # ========== 数据库配置 ==========
     
-    # --- 本地 Docker MySQL (当前使用) ---
-    DB_USER: str = get_config_value("DB_USER", "root")
-    DB_PASSWORD: str = get_config_value("DB_PASSWORD", "123456")
-    DB_HOST: str = get_config_value("DB_HOST", "127.0.0.1")
-    DB_PORT: int = int(get_config_value("DB_PORT", "3306"))
-    DB_NAME: Optional[str] = get_config_value("DB_NAME", None)  # 本地数据库，启动时选择
+    # --- 本地 Docker MySQL (备用，取消注释切换) ---
+    # DB_USER: str = get_config_value("DB_USER", "root")
+    # DB_PASSWORD: str = get_config_value("DB_PASSWORD", "123456")
+    # DB_HOST: str = get_config_value("DB_HOST", "127.0.0.1")
+    # DB_PORT: int = int(get_config_value("DB_PORT", "3306"))
+    # DB_NAME: Optional[str] = get_config_value("DB_NAME", None)  # 本地数据库，启动时选择
     
-    # --- 云端 MySQL (备用，取消注释切换) ---
-    # DB_USER: str = get_config_value("DB_USER", "bobo11")
-    # DB_PASSWORD: str = get_config_value("DB_PASSWORD", "ls0OmCgVJIXHwawv")
-    # DB_HOST: str = get_config_value("DB_HOST", "mysql2.sqlpub.com")
-    # DB_PORT: int = int(get_config_value("DB_PORT", "3307"))
-    # DB_NAME: Optional[str] = get_config_value("DB_NAME", "wutongbei")  # 云端数据库名
+    # --- 云端 MySQL (当前使用) ---
+    DB_USER: str = get_config_value("DB_USER", "bobo11")
+    DB_PASSWORD: str = get_config_value("DB_PASSWORD", "ls0OmCgVJIXHwawv")
+    DB_HOST: str = get_config_value("DB_HOST", "mysql2.sqlpub.com")
+    DB_PORT: int = int(get_config_value("DB_PORT", "3307"))
+    DB_NAME: Optional[str] = get_config_value("DB_NAME", "wutongbei")  # 云端数据库名
     
     # LLM 配置
     MODEL_NAME: str = get_config_value("MODEL_NAME", "qwen3-max")

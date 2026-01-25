@@ -194,6 +194,61 @@ class AgentTraceHandler(BaseCallbackHandler):
             self.trace[idx]["output"] = f"Error: {error}"
 
 
+class TokenUsageHandler(BaseCallbackHandler):
+    """追踪 LLM 调用的 Token 使用量。"""
+
+    def __init__(self) -> None:
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_tokens = 0
+        self.llm_calls = 0
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        """LLM 调用结束时提取 token 使用信息。"""
+        self.llm_calls += 1
+        
+        # 尝试从 response 中获取 token 使用信息
+        # ChatTongyi 返回的 response.llm_output 或 generations 中包含 usage 信息
+        try:
+            # 方式1：从 llm_output 获取（某些版本）
+            if hasattr(response, 'llm_output') and response.llm_output:
+                usage = response.llm_output.get('token_usage') or response.llm_output.get('usage') or {}
+                self.total_input_tokens += usage.get('input_tokens', 0) or usage.get('prompt_tokens', 0)
+                self.total_output_tokens += usage.get('output_tokens', 0) or usage.get('completion_tokens', 0)
+                self.total_tokens += usage.get('total_tokens', 0)
+                return
+            
+            # 方式2：从 generations 的 generation_info 获取
+            if hasattr(response, 'generations') and response.generations:
+                for gen_list in response.generations:
+                    for gen in gen_list:
+                        if hasattr(gen, 'generation_info') and gen.generation_info:
+                            usage = gen.generation_info.get('token_usage') or gen.generation_info.get('usage') or {}
+                            self.total_input_tokens += usage.get('input_tokens', 0) or usage.get('prompt_tokens', 0)
+                            self.total_output_tokens += usage.get('output_tokens', 0) or usage.get('completion_tokens', 0)
+                            self.total_tokens += usage.get('total_tokens', 0)
+                            return
+                        # 另一种格式：message.usage_metadata
+                        if hasattr(gen, 'message') and hasattr(gen.message, 'usage_metadata'):
+                            meta = gen.message.usage_metadata
+                            if meta:
+                                self.total_input_tokens += getattr(meta, 'input_tokens', 0)
+                                self.total_output_tokens += getattr(meta, 'output_tokens', 0)
+                                self.total_tokens += getattr(meta, 'total_tokens', 0)
+                                return
+        except Exception:
+            pass  # 静默处理，避免因 token 统计失败而中断主流程
+
+    def get_usage(self) -> Dict[str, int]:
+        """获取 token 使用统计。"""
+        return {
+            "input_tokens": self.total_input_tokens,
+            "output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_tokens or (self.total_input_tokens + self.total_output_tokens),
+            "llm_calls": self.llm_calls,
+        }
+
+
 class SQLAgent:
     """SQL Agent 主类"""
     
@@ -471,8 +526,9 @@ class SQLAgent:
         用于：先拿到 SQL 再开始流式生成最终回答。
         """
         trace_handler = AgentTraceHandler()
+        token_handler = TokenUsageHandler()  # 追踪 token 使用
         extra_callbacks = callbacks or []
-        callbacks_list: List[BaseCallbackHandler] = [trace_handler, *extra_callbacks]
+        callbacks_list: List[BaseCallbackHandler] = [trace_handler, token_handler, *extra_callbacks]
 
         # 使用 LLM 智能判断用户想要的数据行数（仅在非 verify_only 模式）
         if not self._verify_only:
@@ -507,6 +563,8 @@ class SQLAgent:
                 "sql_output": last_sql_output,
                 # 保留 agent 原始 output 以便兜底
                 "agent_output": result.get("output", ""),
+                # Token 使用统计
+                "token_usage": token_handler.get_usage(),
             }
         except Exception as e:
             return {
@@ -514,6 +572,7 @@ class SQLAgent:
                 "question": question,
                 "database": self.db_name,
                 "error": str(e),
+                "token_usage": token_handler.get_usage(),  # 即使失败也返回已消耗的 token
             }
 
     def stream_final_answer(

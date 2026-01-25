@@ -993,6 +993,26 @@ for msg_idx, message in enumerate(st.session_state.messages):
             except Exception as e:
                 st.caption(f"⚠️ 查询结果展示失败：{e}")
         
+        # 显示 Token 使用统计（历史消息，美化版）
+        if message["role"] == "assistant" and message.get("token_usage"):
+            token_usage = message["token_usage"]
+            input_tokens = token_usage.get("input_tokens", 0)
+            output_tokens = token_usage.get("output_tokens", 0)
+            total_tokens = token_usage.get("total_tokens", 0) or (input_tokens + output_tokens)
+            llm_calls = token_usage.get("llm_calls", 0)
+            if total_tokens > 0:
+                st.markdown("---")
+                st.markdown("##### 📊 Token 使用统计")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("📥 输入", f"{input_tokens:,}")
+                with col2:
+                    st.metric("📤 输出", f"{output_tokens:,}")
+                with col3:
+                    st.metric("📊 总计", f"{total_tokens:,}")
+                with col4:
+                    st.metric("🔄 调用次数", f"{llm_calls}")
+        
         # 显示消息内容（允许助手消息 content 为空：只展示表格/下载等组件，不额外输出"查询完成…"文案）
         content = message.get("content", "")
         if isinstance(content, str) and content.strip():
@@ -1297,6 +1317,26 @@ if st.session_state.pending_prompt and st.session_state.is_running:
             else:
                 st.caption("⚠️ 未捕获到可用于展示的数据查询 SQL（last_sql 为空）。")
 
+            # 显示 Token 使用统计（美化版）
+            token_usage = tool_result.get("token_usage")
+            if token_usage:
+                input_tokens = token_usage.get("input_tokens", 0)
+                output_tokens = token_usage.get("output_tokens", 0)
+                total_tokens = token_usage.get("total_tokens", 0) or (input_tokens + output_tokens)
+                llm_calls = token_usage.get("llm_calls", 0)
+                if total_tokens > 0:
+                    st.markdown("---")
+                    st.markdown("##### 📊 Token 使用统计")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("📥 输入", f"{input_tokens:,}")
+                    with col2:
+                        st.metric("📤 输出", f"{output_tokens:,}")
+                    with col3:
+                        st.metric("📊 总计", f"{total_tokens:,}")
+                    with col4:
+                        st.metric("🔄 调用次数", f"{llm_calls}")
+
             # 保存到消息历史：保存 last_sql + effective_limit + full_count + echarts_viz + trace
             msg = {"role": "assistant", "content": "", "question": prompt}
             if tool_result.get("sql"):
@@ -1312,11 +1352,20 @@ if st.session_state.pending_prompt and st.session_state.is_running:
                 msg["echarts_viz"] = echarts_viz  # 缓存图表配置，历史渲染时直接使用
             if tool_result.get("trace"):
                 msg["trace"] = tool_result["trace"]  # 保存工具调用轨迹
+            if tool_result.get("token_usage"):
+                msg["token_usage"] = tool_result["token_usage"]  # 保存 token 使用统计
             st.session_state.messages.append(msg)
             current_conv["updated_at"] = time.time()
         else:
             error_msg = f"❌ 查询失败: {tool_result.get('error', '未知错误')}"
             st.error(error_msg)
+            # 失败时也显示已消耗的 token（简洁版）
+            token_usage = tool_result.get("token_usage")
+            if token_usage:
+                total_tokens = token_usage.get("total_tokens", 0)
+                llm_calls = token_usage.get("llm_calls", 0)
+                if total_tokens > 0:
+                    st.info(f"📊 已消耗 Token：**{total_tokens:,}**（{llm_calls} 次调用）")
             st.session_state.messages.append({"role": "assistant", "content": error_msg})
             current_conv["updated_at"] = time.time()
 
