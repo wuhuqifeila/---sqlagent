@@ -683,28 +683,44 @@ with st.sidebar:
 
     st.divider()
 
-    # 数据库选择（使用缓存避免重复查询）
+    # 数据库选择（固定列表，映射到实际数据库）
     st.title("⚙️ 配置")
-    @st.cache_data(ttl=300)  # 缓存5分钟
-    def get_databases():
-        return Config.get_available_databases()
-
+    
+    # 显示名称 -> 实际数据库名 的映射
+    DB_DISPLAY_MAP = {
+        "Financial Asset Management": "wutongbei",
+        "Healthcare Analytics": "wutongbei",  # 假选项，实际也连到 wutongbei
+    }
+    display_names = list(DB_DISPLAY_MAP.keys())
+    
+    # 反向映射：实际数据库名 -> 显示名称（用于显示当前选中项）
+    def get_display_name(actual_db: str) -> str:
+        for name, db in DB_DISPLAY_MAP.items():
+            if db == actual_db:
+                return name
+        return actual_db
+    
     try:
-        databases = get_databases()
-        selected_db = st.selectbox(
+        current_display = get_display_name(st.session_state.db_name)
+        current_index = display_names.index(current_display) if current_display in display_names else 0
+        
+        selected_display = st.selectbox(
             "选择数据库",
-            databases,
-            index=databases.index(st.session_state.db_name) if st.session_state.db_name in databases else 0
+            display_names,
+            index=current_index
         )
+        
+        # 将显示名称映射为实际数据库名
+        actual_db = DB_DISPLAY_MAP.get(selected_display, "wutongbei")
 
-        if selected_db != st.session_state.db_name:
-            with st.spinner(f"切换到数据库 {selected_db}..."):
+        if actual_db != st.session_state.db_name:
+            with st.spinner(f"切换到数据库 {selected_display}..."):
                 # 清除缓存，重新获取新数据库的 Agent
                 get_sql_agent.clear()
-                st.session_state.db_name = selected_db
+                st.session_state.db_name = actual_db
                 st.rerun()  # 重新运行以使用新的数据库
     except Exception as e:
-        st.error(f"获取数据库列表失败: {e}")
+        st.error(f"数据库选择失败: {e}")
 
     st.divider()
 
@@ -712,7 +728,10 @@ with st.sidebar:
 
 # 主界面
 st.title("🤖 SQL Agent - 智能 MySQL 查询助手")
-st.caption(f"当前数据库: **{st.session_state.db_name}**")
+# 显示友好的数据库名称
+_db_friendly_names = {"wutongbei": "Financial Asset Management"}
+_current_db_display = _db_friendly_names.get(st.session_state.db_name, st.session_state.db_name)
+st.caption(f"当前数据库: **{_current_db_display}**")
 
 # 显示对话历史（使用缓存的数据，避免重复渲染）
 for msg_idx, message in enumerate(st.session_state.messages):
